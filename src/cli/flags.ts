@@ -374,6 +374,7 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option("--no-fs", "Do not advertise ACP filesystem capabilities")
     .option("--no-terminal", "Do not advertise ACP terminal capability")
+    .option("--acp", "Serve the agent as an ACP server over stdio (proxy mode)")
     .option("--timeout <seconds>", "Maximum time to wait for agent response", parseTimeoutSeconds)
     .option(
       "--ttl <seconds>",
@@ -433,6 +434,31 @@ function resolveCommandOption(command: Command, key: string, fallback: unknown):
     }
   }
   return fallback;
+}
+
+// --acp may sit on the program or the agent command; find the cli-level value.
+export function isAcpProxyRequested(command: Command): boolean {
+  for (let current: Command | null = command; current; current = current.parent) {
+    if (current.getOptionValueSource("acp") === "cli") {
+      return true;
+    }
+  }
+  return false;
+}
+
+const ACP_PROXY_ALLOWED_OPTION_KEYS = new Set(["acp", "agent", "cwd", "verbose"]);
+
+export function collectUnsupportedAcpProxyFlags(command: Command): string[] {
+  const rejected: string[] = [];
+  for (let current: Command | null = command; current; current = current.parent) {
+    for (const option of current.options) {
+      const key = option.attributeName();
+      if (!ACP_PROXY_ALLOWED_OPTION_KEYS.has(key) && current.getOptionValueSource(key) === "cli") {
+        rejected.push(option.long ?? option.flags);
+      }
+    }
+  }
+  return rejected;
 }
 
 export function resolvePromptFlags(flags: PromptFlags, command: Command): PromptFlags {

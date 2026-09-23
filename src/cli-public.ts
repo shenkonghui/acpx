@@ -43,7 +43,11 @@ export function configurePublicCli(options: ConfigurePublicCliOptions): void {
     this: Command,
     promptParts: string[],
   ) {
-    if (promptParts.length === 0 && process.stdin.isTTY) {
+    if (
+      promptParts.length === 0 &&
+      process.stdin.isTTY &&
+      this.getOptionValueSource("acp") !== "cli"
+    ) {
       if (options.requestedJsonStrict) {
         throw new InvalidArgumentError(
           "Prompt is required (pass as argument, --file, or pipe via stdin)",

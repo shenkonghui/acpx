@@ -2,7 +2,7 @@ import type { AnyMessage, SessionNotification } from "@agentclientprotocol/sdk";
 
 type JsonRpcId = string | number | null;
 
-function asRecord(value: unknown): Record<string, unknown> | null {
+export function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }

@@ -22,6 +22,8 @@ import type {
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  collectUnsupportedAcpProxyFlags,
+  isAcpProxyRequested,
   parseHistoryLimit,
   resolveAgentInvocation,
   resolveGlobalFlags,
@@ -224,6 +226,30 @@ async function findRoutedSessionOrThrow(
   );
 }
 
+export async function handleAcpProxy(
+  explicitAgentName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const unsupported = collectUnsupportedAcpProxyFlags(command);
+  if (unsupported.length > 0) {
+    throw new InvalidArgumentError(
+      `--acp does not support ${unsupported.join(", ")}; the upstream ACP client owns sessions, permissions, models, and output`,
+    );
+  }
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { runAcpProxy } = await import("../acp/proxy.js");
+  process.exitCode = await runAcpProxy({
+    agentCommand: agent.agentCommand,
+    agentArgv: agent.agentArgv,
+    cwd: agent.cwd,
+    authCredentials: config.auth,
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
+    verbose: globalFlags.verbose,
+  });
+}
+
 export async function handlePrompt(
   explicitAgentName: string | undefined,
   promptParts: string[],
@@ -232,6 +258,13 @@ export async function handlePrompt(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const promptFlags = resolvePromptFlags(flags, command);
+  if (isAcpProxyRequested(command)) {
+    if (promptParts.length > 0 || promptFlags.file !== undefined) {
+      throw new InvalidArgumentError("--acp does not take a prompt");
+    }
+    await handleAcpProxy(explicitAgentName, command, config);
+    return;
+  }
   const globalFlags = resolveGlobalFlags(command, config);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);

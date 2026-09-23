@@ -31,3 +31,14 @@ For a `devin` executable with `acp`, `--acp`, or `--experimental-acp`, acpx pres
 For example, `ACPX_DEVIN_WINDSURF_VERSION=1.120.0 acpx devin exec 'summarize this repo'` overrides the advertised version. Other agents retain standard acpx identity and capabilities.
 
 Keep the compatibility scope narrow: additional Windsurf/Cognition capabilities need an implemented client operation or fresh Devin proof that initialization requires them.
+
+## ACP server proxy
+
+`acpx devin --acp` serves Devin as an ACP server over stdio, relaying JSON-RPC between an upstream ACP client (for example an editor) and `devin acp`:
+
+```bash
+acpx devin --acp
+acpx --agent 'devin --model swe-2-high acp' --acp
+```
+
+The same compatibility contract applies while proxying: acpx rewrites the upstream `initialize` request with the scoped Windsurf `clientInfo` and the `cognition.ai/requestDiagnostics` capability `_meta`, and answers `_cognition.ai/request_diagnostics` requests itself instead of forwarding them upstream.

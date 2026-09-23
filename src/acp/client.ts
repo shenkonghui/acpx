@@ -35,7 +35,6 @@ import {
   type SessionConfigOption,
 } from "@agentclientprotocol/sdk";
 import { FsSafeError } from "@openclaw/fs-safe/errors";
-import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import {
   assertControlAuthority,
   TimeoutError,
@@ -81,20 +80,20 @@ import {
   buildClaudeCodeOptionsMeta,
   buildGeminiAcpStartupTimeoutMessage,
   buildQoderAcpCommandArgs,
-  ensureCopilotAcpSupport,
   isClaudeAcpCommand,
-  isCopilotAcpCommand,
-  isDevinAcpCommand,
-  isGeminiAcpCommand,
-  isQoderAcpCommand,
   resolveAgentCloseAfterStdinEndMs,
   resolveClaudeAcpSessionCreateTimeoutMs,
-  resolveClaudeCodeExecutable,
   resolveClaudeCodeSettingSources,
   resolveGeminiAcpStartupTimeoutMs,
-  resolveGeminiCommandArgs,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
+import {
+  ensureAgentLaunchSupport,
+  logAgentLaunch,
+  resolveAgentLaunchPlan as resolveSharedAgentLaunchPlan,
+  retireAgentProcess,
+  type AgentLaunchPlan,
+} from "./agent-launch.js";
 import { extractAgentSessionId } from "./agent-session-id.js";
 import {
   buildAgentSpawnOptions,
@@ -152,9 +151,6 @@ export { parseAcpJsonMessageLine } from "./ndjson-stream.js";
 const REPLAY_IDLE_MS = 80;
 const REPLAY_DRAIN_TIMEOUT_MS = 5_000;
 const DRAIN_POLL_INTERVAL_MS = 20;
-const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
-const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
-const AGENT_CLEANUP_BUDGET_MS = 8_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
 const ELICITATION_CANCEL_MESSAGES = {
   inactive: "elicitation owner is no longer active",
@@ -327,18 +323,6 @@ type AuthSelection = {
   methodId: string;
   credential?: string;
   source: "env" | "config" | "agent";
-};
-
-type AgentLaunchPlan = {
-  spawnCommand: string;
-  args: string[];
-  resolvedBuiltInLaunch: ReturnType<typeof resolveBuiltInAgentLaunch>;
-  devinAcp: boolean;
-  geminiAcp: boolean;
-  copilotAcp: boolean;
-  claudeAcp: boolean;
-  spawnOptions: ReturnType<typeof buildAgentSpawnOptions>;
-  commandContext: Parameters<typeof resolveGeminiCommandArgs>[2];
 };
 
 type StartupFailureWatcher = {
@@ -709,95 +693,52 @@ export class AcpClient {
     return epoch;
   }
 
-  private async resolveAgentLaunchPlan(
+  private resolveAgentLaunchPlan(
     epoch: number,
     authority?: AcpControlAuthority,
   ): Promise<AgentLaunchPlan> {
-    const configuredCommand = resolveAgentCommandParts(
-      this.options.agentCommand,
-      this.options.agentArgv,
-    );
-    const resolvedBuiltInLaunch = resolveBuiltInAgentLaunch(this.options.agentCommand);
-    const spawnCommand = resolvedBuiltInLaunch?.command ?? configuredCommand.command;
-    const spawnOptions = buildAgentSpawnOptions(
-      this.options.cwd,
-      this.options.authCredentials,
-      this.options.sessionOptions?.env,
-      this.options.agentProcessEnv,
-    );
-    const commandContext: AgentLaunchPlan["commandContext"] = {
-      env: spawnOptions.env,
-      readOutput: async (command, args, timeoutMs, diagnostic = false) => {
-        try {
-          const output = await this.readAgentCommandOutput(
-            command,
-            args,
-            timeoutMs,
-            spawnOptions,
-            epoch,
-            authority,
-          );
-          // Retirement may await while close() revokes this startup generation.
-          await admitCommandProbe(() => this.assertCommandProbeActive(epoch, authority));
-          return output;
-        } catch (error) {
-          if (error instanceof CommandProbeAdmissionError) {
-            if (diagnostic) {
-              return undefined;
-            }
-            throw error.reason;
-          }
-          throw error;
-        }
+    return resolveSharedAgentLaunchPlan(
+      {
+        agentCommand: this.options.agentCommand,
+        agentArgv: this.options.agentArgv,
+        cwd: this.options.cwd,
+        authCredentials: this.options.authCredentials,
+        sessionOptions: this.options.sessionOptions,
+        agentProcessEnv: this.options.agentProcessEnv,
       },
-    };
-    let args = resolvedBuiltInLaunch?.args ?? configuredCommand.args;
-    args = await resolveGeminiCommandArgs(spawnCommand, args, commandContext);
-    if (isQoderAcpCommand(spawnCommand, args)) {
-      args = buildQoderAcpCommandArgs(args, this.options);
-    }
-    return {
-      spawnCommand,
-      args,
-      resolvedBuiltInLaunch,
-      devinAcp: isDevinAcpCommand(spawnCommand, args),
-      geminiAcp: isGeminiAcpCommand(spawnCommand, args),
-      copilotAcp: isCopilotAcpCommand(spawnCommand, args),
-      claudeAcp: isClaudeAcpCommand(spawnCommand, args),
-      spawnOptions,
-      commandContext,
-    };
+      (spawnOptions) =>
+        async (command, args, timeoutMs, diagnostic = false) => {
+          try {
+            const output = await this.readAgentCommandOutput(
+              command,
+              args,
+              timeoutMs,
+              spawnOptions,
+              epoch,
+              authority,
+            );
+            // Retirement may await while close() revokes this startup generation.
+            await admitCommandProbe(() => this.assertCommandProbeActive(epoch, authority));
+            return output;
+          } catch (error) {
+            if (error instanceof CommandProbeAdmissionError) {
+              if (diagnostic) {
+                return undefined;
+              }
+              throw error.reason;
+            }
+            throw error;
+          }
+        },
+    );
   }
 
   private logAgentLaunch(plan: AgentLaunchPlan): void {
-    const launch = plan.resolvedBuiltInLaunch;
-    if (launch?.source === "installed") {
-      this.log(
-        `spawning installed built-in agent ${launch.packageName}${launch.packageVersion ? `@${launch.packageVersion}` : ""} via ${plan.spawnCommand} ${plan.args.join(" ")}`,
-      );
-      return;
-    }
-    if (launch?.source === "package-exec") {
-      this.log(
-        `spawning built-in agent ${launch.packageName}@${launch.packageRange} via current Node package exec bridge ${plan.spawnCommand} ${plan.args.join(" ")}`,
-      );
-      return;
-    }
-    this.log(`spawning agent: ${plan.spawnCommand} ${plan.args.join(" ")}`);
+    logAgentLaunch(plan, (message) => this.log(message));
   }
 
   private async ensureLaunchSupport(plan: AgentLaunchPlan): Promise<void> {
-    if (plan.copilotAcp) {
-      await ensureCopilotAcpSupport(plan.spawnCommand, plan.commandContext);
-    }
-    if (!plan.claudeAcp) {
-      return;
-    }
-    const claudeExe = resolveClaudeCodeExecutable(process.platform, plan.spawnOptions.env);
-    if (claudeExe) {
-      plan.spawnOptions.env.CLAUDE_CODE_EXECUTABLE = claudeExe;
-      this.log(`resolved system Claude Code executable: ${claudeExe}`);
-    }
+    await ensureAgentLaunchSupport(plan, (message) => this.log(message));
   }
 
   private prepareProcessLaunch(
@@ -1807,69 +1748,16 @@ export class AcpClient {
 
   private async cleanupAgentProcess(child: ChildProcess): Promise<void> {
     const descendants = this.agentDescendants.get(child);
-    const deadline = performance.now() + AGENT_CLEANUP_BUDGET_MS;
-    const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
     try {
-      if (descendants) {
-        await descendants.capture(Math.max(1, deadline - performance.now()));
-      }
-      this.endAgentStdin(child);
-      await waitForChildExit(
-        child,
-        Math.min(stdinCloseGraceMs, Math.max(0, deadline - performance.now())),
-      );
-      const exited = await this.signalAgentAndDescendants(
-        child,
-        "SIGTERM",
-        AGENT_CLOSE_TERM_GRACE_MS,
-        deadline,
-      );
-      if (!exited) {
-        this.log("agent processes did not exit after SIGTERM; forcing SIGKILL");
-        await this.signalAgentAndDescendants(child, "SIGKILL", AGENT_CLOSE_KILL_GRACE_MS, deadline);
-      }
+      await retireAgentProcess(child, descendants, {
+        stdinCloseGraceMs: resolveAgentCloseAfterStdinEndMs(this.options.agentCommand),
+        log: (message) => this.log(message),
+      });
     } finally {
       descendants?.retire();
       // Stdio must not keep acpx alive after teardown, even if an OS query failed.
       this.detachAgentHandles(child, isChildProcessRunning(child));
     }
-  }
-
-  private endAgentStdin(child: ChildProcess): void {
-    // Closing stdin is the most graceful shutdown signal for stdio-based ACP agents.
-    if (!child.stdin || child.stdin.destroyed) {
-      return;
-    }
-    try {
-      child.stdin.end();
-    } catch {
-      // best effort
-    }
-  }
-
-  private async signalAgentAndDescendants(
-    child: ChildProcess,
-    signal: NodeJS.Signals,
-    waitMs: number,
-    deadline: number,
-  ): Promise<boolean> {
-    const descendants = this.agentDescendants.get(child);
-    if (descendants && performance.now() < deadline) {
-      await descendants.signal(signal, deadline - performance.now());
-    }
-    if (isChildProcessRunning(child)) {
-      try {
-        child.kill(signal);
-      } catch {
-        // The direct child may have exited during descendant inspection.
-      }
-    }
-    const remaining = Math.min(waitMs, Math.max(0, deadline - performance.now()));
-    const [exited, descendantsExited] = await Promise.all([
-      waitForChildExit(child, remaining),
-      descendants ? descendants.waitForExit(remaining) : Promise.resolve(true),
-    ]);
-    return exited && descendantsExited;
   }
 
   private detachAgentHandles(agent: ChildProcess, unref: boolean): void {

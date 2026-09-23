@@ -307,6 +307,7 @@ export function registerAgentCommand(
 
   addSessionOption(agentCommand);
   addPromptInputOption(agentCommand);
+  agentCommand.option("--acp", "Serve the agent as an ACP server over stdio (proxy mode)");
   agentCommand.action(async function (this: Command, promptParts: string[], flags: PromptFlags) {
     await handlePrompt(agentName, promptParts, flags, this, config);
   });

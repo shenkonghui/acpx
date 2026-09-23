@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import path from "node:path";
-import { Command, CommanderError } from "commander";
+import { Command, CommanderError, InvalidArgumentError } from "commander";
 import {
   exitCodeForOutputErrorCode,
   normalizeOutputError,
@@ -16,6 +16,7 @@ import { scanCompareArgs } from "./cli/compare-args.js";
 import { loadResolvedConfig } from "./cli/config.js";
 import {
   addGlobalFlags,
+  isAcpProxyRequested,
   parseAllowedTools,
   parseMaxTurns,
   parseTtlSeconds,
@@ -68,6 +69,7 @@ const TOP_LEVEL_VERSION_VALUE_FLAG_VALUES = [
 const TOP_LEVEL_VERSION_VALUE_FLAGS = new Set<string>(TOP_LEVEL_VERSION_VALUE_FLAG_VALUES);
 
 const TOP_LEVEL_VERSION_BOOLEAN_FLAGS = new Set([
+  "--acp",
   "--approve-all",
   "--approve-reads",
   "--deny-all",
@@ -541,6 +543,20 @@ export async function main(argv: string[] = process.argv): Promise<void> {
       handlePromptAction: async (command, promptParts) => {
         await handlePrompt(undefined, promptParts, {}, command, config);
       },
+    });
+
+    // --acp only applies to prompt entry points: the program default action,
+    // agent commands, and the prompt subcommand. Reject it on other verbs.
+    program.hook("preAction", (thisCommand, actionCommand) => {
+      if (!isAcpProxyRequested(actionCommand)) {
+        return;
+      }
+      const isAgentCommand =
+        actionCommand.parent === thisCommand && !TOP_LEVEL_VERBS.has(actionCommand.name());
+      if (actionCommand === thisCommand || actionCommand.name() === "prompt" || isAgentCommand) {
+        return;
+      }
+      throw new InvalidArgumentError("--acp does not take a subcommand");
     });
 
     program.exitOverride((error) => {

@@ -12,7 +12,7 @@ const GEMINI_ACP_FLAG_VERSION = [0, 33, 0] as const;
 const COPILOT_HELP_TIMEOUT_MS = 2_000;
 const CLAUDE_CODE_DEFAULT_SETTING_SOURCES = ["project", "local"] as const;
 
-type AgentCommandContext = {
+export type AgentCommandContext = {
   env: NodeJS.ProcessEnv;
   readOutput: (
     command: string,

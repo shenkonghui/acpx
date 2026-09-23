@@ -126,6 +126,7 @@ All global options:
 | `--timeout <seconds>`                    | Max wait time for agent response                    | Must be positive. Decimal seconds allowed.                                                                                                            |
 | `--ttl <seconds>`                        | Queue owner idle TTL before shutdown                | Default `300`. `0` disables TTL.                                                                                                                      |
 | `--model <id>`                           | Set agent model                                     | Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.      |
+| `--acp`                                  | ACP server proxy mode                               | Serve the agent as an ACP server over stdio instead of prompting. See [`--acp` proxy mode](#--acp-proxy-mode).                                        |
 | `--verbose`                              | Enable verbose logs                                 | Prints ACP/debug details to stderr.                                                                                                                   |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
@@ -274,6 +275,42 @@ Behavior:
 acpx --model gpt-5.4 codex exec \
   --config-option reasoning_effort=high \
   'review this checkout'
+```
+
+## `--acp` proxy mode
+
+Serve an agent as an ACP server over stdio, so an upstream ACP client can talk to
+the agent through acpx:
+
+```bash
+acpx [global_options] <agent> --acp
+acpx [global_options] --acp                            # defaults to codex
+acpx [global_options] --agent '<command>' --acp        # raw agent command
+```
+
+Behavior:
+
+- Spawns the resolved agent command and relays NDJSON JSON-RPC traffic in both
+  directions: upstream client --stdio--> acpx --stdio--> agent.
+- stdout carries protocol messages only; non-JSON lines on the agent's stdout are
+  moved to acpx stderr with an `[acpx] agent stdout (non-JSON):` prefix, and the
+  agent's stderr is forwarded to acpx stderr.
+- `--acp` only accepts `--cwd`, `--agent`, and `--verbose`. Other CLI flags are
+  rejected because sessions, permissions, models, and output are owned by the
+  upstream ACP client.
+- When the upstream stdin closes, acpx ends the agent's stdin, waits a short
+  grace period, then escalates through `SIGTERM` and `SIGKILL` until the agent
+  exits. `SIGINT`/`SIGTERM` sent to acpx run the same retirement sequence and
+  exit with code `130`.
+- Exit codes: `0` when upstream closes stdin and the agent retires cleanly, `130`
+  when interrupted by a signal, otherwise the agent's own exit code (`1` if the
+  agent exited by signal).
+- Agent-specific compatibility behavior still applies while proxying (for example,
+  an agent that requires a specific `clientInfo` during `initialize` still gets it).
+
+```bash
+acpx codex --acp
+acpx --agent './my-custom-server --acp' --acp
 ```
 
 ## `compare` subcommand

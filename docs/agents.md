@@ -48,6 +48,7 @@ Every built-in agent supports the same command surface:
 acpx <agent> [prompt_text...]                 # implicit prompt
 acpx <agent> prompt [prompt_text...]          # explicit prompt
 acpx <agent> exec [prompt_text...]            # one-shot, no saved session
+acpx <agent> --acp                            # serve as an ACP server over stdio (proxy)
 acpx <agent> cancel [-s <name>]               # cooperative session/cancel
 acpx <agent> set-mode <mode> [-s <name>]      # session/set_mode
 acpx <agent> set <key> <value> [-s <name>]    # session/set_config_option

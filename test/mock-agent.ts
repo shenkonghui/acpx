@@ -830,6 +830,7 @@ class MockAgent implements Agent {
   private readonly sessions = new Map<SessionId, SessionState>();
   private readonly options: MockAgentOptions;
   private clientCapabilities?: InitializeRequest["clientCapabilities"];
+  private clientInfo?: InitializeRequest["clientInfo"];
 
   constructor(connection: AgentConnection, options: MockAgentOptions) {
     this.connection = connection;
@@ -838,6 +839,7 @@ class MockAgent implements Agent {
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = structuredClone(params.clientCapabilities);
+    this.clientInfo = structuredClone(params.clientInfo);
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
       ...(this.options.supportsListSessions ? { list: {} } : {}),
@@ -1339,6 +1341,10 @@ class MockAgent implements Agent {
 
     if (text === "client-capabilities") {
       return JSON.stringify(this.clientCapabilities);
+    }
+
+    if (text === "client-info") {
+      return JSON.stringify(this.clientInfo ?? null);
     }
 
     if (text.startsWith("elicitation ")) {

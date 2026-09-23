@@ -199,6 +199,16 @@ Behavior:
 - `--format quiet` prints `<agent>\t<status>` per row
 - Does not create saved sessions or separate compare transcript directories
 
+### ACP server proxy (`--acp`)
+
+```bash
+acpx codex --acp
+acpx --agent 'devin acp' --acp
+```
+
+- `--acp` spawns the resolved agent and relays NDJSON JSON-RPC over stdio in both directions, so an upstream ACP client (for example an editor) can use acpx as the agent's server.
+- Agent-specific compatibility shims still apply while proxying; `acpx devin --acp` rewrites `initialize` with the scoped Windsurf identity and answers `_cognition.ai/request_diagnostics` itself.
+
 ### Cancel / Mode / Config / Model
 
 ```bash

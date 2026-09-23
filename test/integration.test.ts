@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
@@ -1626,6 +1627,423 @@ for (const invocation of [
     });
   });
 }
+
+test("integration: --acp proxies NDJSON between client and agent", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const stdin = [
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: 1,
+            clientCapabilities: {
+              fs: { readTextFile: true, writeTextFile: true },
+              terminal: true,
+            },
+          },
+        }),
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/new",
+          params: { cwd, mcpServers: [] },
+        }),
+        "",
+      ].join("\n");
+
+      const result = await runCli(["--agent", MOCK_AGENT_COMMAND, "--cwd", cwd, "--acp"], homeDir, {
+        stdin,
+      });
+
+      assert.equal(result.code, 0, result.stderr);
+      const messages = parseJsonRpcOutputLines(result.stdout);
+      const initResponse = messages.find((message) => message.id === 1);
+      assert(initResponse, result.stdout);
+      assert.equal((initResponse.result as { protocolVersion?: number }).protocolVersion, 1);
+      const newSessionResponse = messages.find((message) => message.id === 2);
+      assert(newSessionResponse, result.stdout);
+      assert.equal(
+        typeof (newSessionResponse.result as { sessionId?: unknown }).sessionId,
+        "string",
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: acp proxy applies Devin client identity and answers diagnostics", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
+
+    try {
+      await writeFakeDevinAgent(fakeBinDir);
+      const proxy = spawnAcpProxy(["--cwd", cwd, "devin", "--acp"], homeDir, {
+        ACPX_DEVIN_WINDSURF_VERSION: "9.9.9-test",
+        PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      });
+
+      try {
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: 1,
+            clientCapabilities: {
+              fs: { readTextFile: true, writeTextFile: true },
+              terminal: true,
+            },
+            clientInfo: { name: "upstream-client", version: "0.0.1" },
+          },
+        });
+        await proxy.next((message) => message.id === 1, "initialize response");
+
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/new",
+          params: { cwd, mcpServers: [] },
+        });
+        const newSessionResponse = await proxy.next(
+          (message) => message.id === 2,
+          "session/new response",
+        );
+        const sessionId = (newSessionResponse.result as { sessionId?: unknown }).sessionId;
+        assert.equal(typeof sessionId, "string", JSON.stringify(newSessionResponse));
+
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 3,
+          method: "session/prompt",
+          params: { sessionId, prompt: [{ type: "text", text: "client-info" }] },
+        });
+        const clientInfoUpdate = await proxy.next(
+          (message) => extractAgentMessageChunkText(message)?.startsWith("{") === true,
+          "client-info update",
+        );
+        assert.deepEqual(JSON.parse(extractAgentMessageChunkText(clientInfoUpdate) ?? ""), {
+          name: "windsurf",
+          version: "9.9.9-test",
+        });
+
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "session/prompt",
+          params: { sessionId, prompt: [{ type: "text", text: "client-capabilities" }] },
+        });
+        const capabilitiesUpdate = await proxy.next(
+          (message) =>
+            extractAgentMessageChunkText(message)?.includes("requestDiagnostics") === true,
+          "client-capabilities update",
+        );
+        assert.equal(
+          (
+            JSON.parse(extractAgentMessageChunkText(capabilitiesUpdate) ?? "{}") as {
+              _meta?: Record<string, unknown>;
+            }
+          )._meta?.["cognition.ai/requestDiagnostics"],
+          true,
+        );
+
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/prompt",
+          params: {
+            sessionId,
+            prompt: [
+              {
+                type: "text",
+                text: "extension-request _cognition.ai/request_diagnostics hello",
+              },
+            ],
+          },
+        });
+        await proxy.next(
+          (message) =>
+            extractAgentMessageChunkText(message)?.includes(
+              "extension request accepted: _cognition.ai/request_diagnostics {}",
+            ) === true,
+          "diagnostics prompt update",
+        );
+        await proxy.next((message) => message.id === 5, "diagnostics prompt response");
+        assert.equal(
+          proxy.received.some((message) => message.method === "_cognition.ai/request_diagnostics"),
+          false,
+          "diagnostics request must be answered by the proxy, not forwarded upstream",
+        );
+      } finally {
+        const result = await proxy.close();
+        assert.equal(result.code, 0, result.stderr);
+      }
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --acp before the agent token also starts the proxy", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
+
+    try {
+      await writeFakeDevinAgent(fakeBinDir);
+      const proxy = spawnAcpProxy(["--acp", "--cwd", cwd, "devin"], homeDir, {
+        PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      });
+
+      try {
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1, clientCapabilities: {} },
+        });
+        const initResponse = await proxy.next((message) => message.id === 1, "initialize response");
+        assert.equal((initResponse.result as { protocolVersion?: number }).protocolVersion, 1);
+      } finally {
+        const result = await proxy.close();
+        assert.equal(result.code, 0, result.stderr);
+      }
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --acp rejects prompt text and other subcommands", async () => {
+  await withTempHome(async (homeDir) => {
+    const promptResult = await runCli(["devin", "--acp", "hello"], homeDir, { stdin: "" });
+    assert.notEqual(promptResult.code, 0);
+    assert.match(promptResult.stderr, /--acp does not take a prompt/);
+
+    const execResult = await runCli(["devin", "--acp", "exec"], homeDir, { stdin: "" });
+    assert.notEqual(execResult.code, 0);
+    assert.match(execResult.stderr, /--acp does not take a subcommand/);
+
+    const fileResult = await runCli(["devin", "--acp", "-f", "some-file.txt"], homeDir, {
+      stdin: "",
+    });
+    assert.notEqual(fileResult.code, 0);
+    assert.match(fileResult.stderr, /--acp does not take a prompt/);
+  });
+});
+
+test("integration: --acp rejects unsupported cli flags", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        ["--format", "json", "--agent", MOCK_AGENT_COMMAND, "--cwd", cwd, "--acp"],
+        homeDir,
+        { stdin: "" },
+      );
+      assert.notEqual(result.code, 0);
+      assert.match(`${result.stdout}${result.stderr}`, /--format/);
+      assert.match(
+        `${result.stdout}${result.stderr}`,
+        /the upstream ACP client owns sessions, permissions, models, and output/,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --acp moves non-JSON agent stdout lines to stderr", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-noisy-agent-"));
+    const wrapperPath = path.join(binDir, "noisy-agent");
+
+    try {
+      await fs.writeFile(
+        wrapperPath,
+        [
+          "#!/bin/sh",
+          'echo "junk-line-from-agent"',
+          `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+          "",
+        ].join("\n"),
+        { encoding: "utf8", mode: 0o755 },
+      );
+
+      const stdin = [
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1, clientCapabilities: {} },
+        }),
+        "",
+      ].join("\n");
+
+      const result = await runCli(["--agent", wrapperPath, "--cwd", cwd, "--acp"], homeDir, {
+        stdin,
+      });
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stderr, /\[acpx\] agent stdout \(non-JSON\): junk-line-from-agent/);
+      const stdoutLines = result.stdout.split("\n").filter((line) => line.trim().length > 0);
+      assert(stdoutLines.length > 0, "expected at least one protocol message on stdout");
+      for (const line of stdoutLines) {
+        assert.doesNotThrow(() => JSON.parse(line), `stdout line must be JSON: ${line}`);
+      }
+      const messages = parseJsonRpcOutputLines(result.stdout);
+      assert(
+        messages.some((message) => message.id === 1),
+        result.stdout,
+      );
+    } finally {
+      await fs.rm(binDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --acp shares the launch plan with exec for built-in gemini", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-gemini-"));
+    const fakeGeminiPath = path.join(fakeBinDir, "gemini");
+
+    try {
+      await fs.writeFile(
+        fakeGeminiPath,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "--version" ]; then',
+          '  echo "0.32.9"',
+          "  exit 0",
+          "fi",
+          'if [ "$1" = "--experimental-acp" ]; then',
+          "  shift",
+          `  exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+          "fi",
+          'if [ "$1" = "--acp" ]; then',
+          "  exit 1",
+          "fi",
+          'echo "unexpected gemini flag: $1" 1>&2',
+          "exit 2",
+          "",
+        ].join("\n"),
+        {
+          encoding: "utf8",
+          mode: 0o755,
+        },
+      );
+
+      const proxy = spawnAcpProxy(["--cwd", cwd, "gemini", "--acp"], homeDir, {
+        PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      });
+
+      try {
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1, clientCapabilities: {} },
+        });
+        const initResponse = await proxy.next((message) => message.id === 1, "initialize response");
+        assert.equal((initResponse.result as { protocolVersion?: number }).protocolVersion, 1);
+      } finally {
+        const result = await proxy.close();
+        assert.equal(result.code, 0, result.stderr);
+      }
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: --acp retires a stubborn agent after upstream stdin closes", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-stubborn-agent-"));
+    const scriptPath = path.join(binDir, "stubborn-agent.mjs");
+
+    try {
+      await fs.writeFile(
+        scriptPath,
+        [
+          'process.on("SIGTERM", () => {});',
+          "process.stdin.resume();",
+          "setInterval(() => {}, 1000);",
+          "",
+        ].join("\n"),
+        { encoding: "utf8" },
+      );
+
+      const result = await runCli(
+        ["--agent", `${process.execPath} ${scriptPath}`, "--cwd", cwd, "--acp"],
+        homeDir,
+        { stdin: "", timeoutMs: 20_000 },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+    } finally {
+      await fs.rm(binDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test(
+  "integration: --acp retires the agent and exits interrupted on SIGTERM",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+      const pidFile = path.join(cwd, "agent.pid");
+
+      try {
+        const proxy = spawnAcpProxy(
+          ["--agent", `${MOCK_AGENT_COMMAND} --pid-file ${pidFile}`, "--cwd", cwd, "--acp"],
+          homeDir,
+        );
+
+        proxy.send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1, clientCapabilities: {} },
+        });
+        await proxy.next((message) => message.id === 1, "initialize response");
+
+        const agentPid = Number((await fs.readFile(pidFile, "utf8")).trim());
+        assert(Number.isInteger(agentPid) && agentPid > 0, "expected agent pid file");
+
+        proxy.child.kill("SIGTERM");
+        const result = await new Promise<CliRunResult>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error("proxy did not exit after SIGTERM")),
+            15_000,
+          );
+          proxy.child.once("close", (code, signal) => {
+            clearTimeout(timer);
+            resolve({ code, signal, stdout: "", stderr: "" });
+          });
+        });
+        assert.equal(result.code, 130);
+        assert.equal(await waitForPidExit(agentPid, 5_000), true, "agent should be dead");
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+  },
+);
 
 test("integration: exec --model sets the advertised model config option", async () => {
   await withTempHome(async (homeDir) => {
@@ -5376,6 +5794,100 @@ async function runCliWithEntry(
       });
     });
   });
+}
+
+type AcpProxySession = {
+  child: ReturnType<typeof spawn>;
+  received: Array<Record<string, unknown>>;
+  send: (message: Record<string, unknown>) => void;
+  next: (
+    predicate: (message: Record<string, unknown>) => boolean,
+    description: string,
+  ) => Promise<Record<string, unknown>>;
+  close: () => Promise<CliRunResult>;
+};
+
+function spawnAcpProxy(args: string[], homeDir: string, env?: NodeJS.ProcessEnv): AcpProxySession {
+  const child = spawn(process.execPath, [CLI_PATH, ...args], {
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      ...env,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const received: Array<Record<string, unknown>> = [];
+  const waiters: Array<{
+    predicate: (message: Record<string, unknown>) => boolean;
+    resolve: (message: Record<string, unknown>) => void;
+  }> = [];
+
+  readline.createInterface({ input: child.stdout, terminal: false }).on("line", (line) => {
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    received.push(message);
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index];
+      if (waiter.predicate(message)) {
+        waiters.splice(index, 1);
+        waiter.resolve(message);
+      }
+    }
+  });
+
+  return {
+    child,
+    received,
+    send: (message) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    },
+    next: (predicate, description) =>
+      new Promise((resolve, reject) => {
+        const buffered = received.find(predicate);
+        if (buffered) {
+          resolve(buffered);
+          return;
+        }
+        const timer = setTimeout(
+          () => reject(new Error(`Timed out waiting for ${description}; stderr: ${stderr}`)),
+          10_000,
+        );
+        waiters.push({
+          predicate,
+          resolve: (message) => {
+            clearTimeout(timer);
+            resolve(message);
+          },
+        });
+      }),
+    close: () =>
+      new Promise<CliRunResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`acp proxy did not exit after stdin close; stderr: ${stderr}`));
+        }, 10_000);
+        child.once("error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+        child.once("close", (code, signal) => {
+          clearTimeout(timer);
+          resolve({ code, signal, stdout: "", stderr });
+        });
+        child.stdin.end();
+      }),
+  };
 }
 
 async function awaitChildClose(child: ReturnType<typeof spawn>): Promise<CliRunResult> {

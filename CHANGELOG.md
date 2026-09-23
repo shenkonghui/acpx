@@ -6,6 +6,10 @@ Repo: https://github.com/openclaw/acpx
 
 ## Unreleased
 
+### Changes
+
+- Add an `--acp` flag (`acpx <agent> --acp`, `acpx --agent '<command>' --acp`) that serves the resolved agent as an ACP server over stdio, relaying NDJSON JSON-RPC between an upstream ACP client and the agent process. Devin's scoped Windsurf `initialize` identity and diagnostics-request answers apply while proxying.
+
 ### Fixes
 
 - Windows/authentication: preserve inherited credential values when auth aliases use different environment-variable casing.

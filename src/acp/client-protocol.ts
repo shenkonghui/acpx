@@ -1,6 +1,7 @@
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import type { AcpElicitationMode } from "../types.js";
 import { getAcpxVersion } from "../version.js";
+import { asRecord } from "./jsonrpc.js";
 
 const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
   "cognition.ai/requestDiagnostics": true,
@@ -20,6 +21,21 @@ export function resolveClientInfo(devinAcp: boolean): { name: string; version: s
   return {
     name: DEVIN_COMPATIBILITY_CLIENT_NAME,
     version: process.env.ACPX_DEVIN_WINDSURF_VERSION ?? DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION,
+  };
+}
+
+export function withDevinClientIdentity(params: Record<string, unknown>): Record<string, unknown> {
+  const capabilities = asRecord(params.clientCapabilities) ?? {};
+  return {
+    ...params,
+    clientInfo: resolveClientInfo(true),
+    clientCapabilities: {
+      ...capabilities,
+      _meta: {
+        ...asRecord(capabilities._meta),
+        ...DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META,
+      },
+    },
   };
 }
 
