@@ -249,7 +249,7 @@ async function runAgentForCompare(params: {
       suppressSdkConsoleErrors: true,
       timeoutMs: params.globalFlags.timeout ?? DEFAULT_COMPARE_TIMEOUT_MS,
       promptRetries: params.globalFlags.promptRetries,
-      sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
+      sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags, agent.agentEnv),
       onSessionUpdate: (notification) => captureSessionUpdate(notification, capture),
       onPermissionStats: (stats) => {
         capture.permissionStats = stats;

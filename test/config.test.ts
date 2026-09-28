@@ -564,6 +564,74 @@ test("loadResolvedConfig rejects ambiguous or quoted legacy command plus args", 
   });
 });
 
+test("loadResolvedConfig parses agent env and surfaces it in display", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            custom: {
+              argv: ["./bin/my-agent", "acp"],
+              env: { MY_AGENT_MODE: "acp", FEATURE: "1" },
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const config = await loadResolvedConfig(cwd);
+    assert.deepEqual(config.agents.custom, {
+      command: './bin/my-agent "acp"',
+      argv: ["./bin/my-agent", "acp"],
+      env: { MY_AGENT_MODE: "acp", FEATURE: "1" },
+    });
+    assert.deepEqual(toConfigDisplay(config).agents.custom, {
+      argv: ["./bin/my-agent", "acp"],
+      env: { MY_AGENT_MODE: "acp", FEATURE: "1" },
+    });
+  });
+});
+
+test("loadResolvedConfig rejects invalid agent env entries", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+
+    const cases: Array<{ env: unknown; pattern: RegExp }> = [
+      {
+        env: "acp",
+        pattern: /Invalid config agents\.custom\.env\b.*expected object of string values/u,
+      },
+      { env: { MODE: 1 }, pattern: /Invalid config agents\.custom\.env\.MODE .*expected string/u },
+      {
+        env: { "BAD=NAME": "v" },
+        pattern: /Invalid config agents\.custom\.env .*invalid environment name/u,
+      },
+      {
+        env: { "": "v" },
+        pattern: /Invalid config agents\.custom\.env .*invalid environment name/u,
+      },
+    ];
+
+    for (const { env, pattern } of cases) {
+      await fs.writeFile(
+        path.join(homeDir, ".acpx", "config.json"),
+        `${JSON.stringify({ agents: { custom: { command: "./bin/my-agent", env } } })}\n`,
+        "utf8",
+      );
+      await assert.rejects(() => loadResolvedConfig(cwd), pattern);
+    }
+  });
+});
+
 async function withTempEnv(run: (ctx: { homeDir: string }) => Promise<void>): Promise<void> {
   const originalHome = process.env.HOME;
 

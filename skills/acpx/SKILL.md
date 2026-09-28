@@ -65,6 +65,7 @@ acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
 acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | watch [-s <name>] [--cursor <cursor>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
+acpx [global_options] registry list | show <agent-id> | install <agent-id> [--method binary|npx|uvx] [--as <name>] [--force] | uninstall <name>
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -119,6 +120,10 @@ Rules:
 - Do not combine a positional agent and `--agent` in the same command.
 - Gemini version checks, Copilot ACP support checks, and their startup diagnostics use the selected agent's working directory and child environment, including session environment and embedded runtime overrides.
 - Embedded host lifecycle admission also covers compatibility and diagnostic invocations. Correlate their events by `launchId`; one session can produce several adapter processes. Checks retire their owned processes and output pipes before settling.
+
+## Registry installs
+
+`acpx registry list|show|install|uninstall` discovers and installs ACP servers from the official ACP agent registry. `install` prefers `binary` (verified by `sha256`), then `npx`, then `uvx`; `--method` forces one. Installed agents are written to `~/.acpx/config.json` as regular `agents` entries, so they resolve like built-ins. Registry entries may carry an `env` map, passed through to the child process. `ACPX_REGISTRY_URL` overrides the registry source.
 
 ## Embedded hosts
 

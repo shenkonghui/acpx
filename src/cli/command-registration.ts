@@ -40,6 +40,7 @@ import {
   type StatusFlags,
 } from "./flags.js";
 import { registerGatewayCommand } from "./gateway-command.js";
+import { registerRegistryCommand } from "./registry-command.js";
 import { registerStatusCommand } from "./status-command.js";
 
 type FlowRunFlags = {
@@ -362,4 +363,5 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerCompareCommand(program, config);
   registerFlowCommand(program, config);
   registerGatewayCommand(program, config);
+  registerRegistryCommand(program, config);
 }

@@ -143,7 +143,7 @@ function buildSessionStartOptions(params: {
     resumeSessionId: params.flags.resumeSession,
     permissionMode: params.permissionMode,
     permissionPolicy: params.permissionPolicy,
-    sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
+    sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags, params.agent.agentEnv),
     onModelWarning: params.globalFlags.jsonStrict
       ? undefined
       : (message) => process.stderr.write(`[acpx] warning: ${message}\n`),
@@ -245,7 +245,7 @@ export async function handleAcpProxy(
     agentArgv: agent.agentArgv,
     cwd: agent.cwd,
     authCredentials: config.auth,
-    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags, agent.agentEnv),
     verbose: globalFlags.verbose,
   });
 }
@@ -307,7 +307,7 @@ export async function handlePrompt(
     maxQueueDepth: config.queueMaxDepth,
     promptRetries: globalFlags.promptRetries,
     waitForCompletion: promptFlags.wait,
-    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags, agent.agentEnv),
   });
 
   if ("queued" in result) {
@@ -370,7 +370,7 @@ export async function handleExec(
     },
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
     promptRetries: globalFlags.promptRetries,
-    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags, agent.agentEnv),
     configOptions: flags.configOption,
   });
 

@@ -10,12 +10,14 @@ import type { GlobalFlags } from "./flags.js";
 
 export function sessionOptionsFromGlobalFlags(
   globalFlags: GlobalFlags,
+  agentEnv?: Record<string, string>,
 ): NonNullable<SessionCreateOptions["sessionOptions"]> {
   return {
     model: globalFlags.model,
     allowedTools: globalFlags.allowedTools,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
+    ...(agentEnv ? { env: agentEnv } : {}),
   };
 }
 

@@ -60,6 +60,8 @@ acpx ci-bot 'run validation checks'
 
 Custom names defined in config win over the built-in registry, so you can also override `codex`, `claude`, etc. with a vendored adapter.
 
+`acpx registry install <agent-id>` is a shortcut for this: it writes the same `argv` (and any required `env`) into `~/.acpx/config.json` after fetching the agent from the official ACP registry. See [Registry](registry.md).
+
 ## Session scope and the agent command
 
 The agent command — whether built-in, unknown positional, `--agent`, or config-defined — is part of the session scope key:

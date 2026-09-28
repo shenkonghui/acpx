@@ -17,9 +17,12 @@ import { toTimerMilliseconds } from "./timer-duration.js";
 export type ResolvedAgentConfig = {
   command: string;
   argv?: string[];
+  env?: Record<string, string>;
 };
 
-type ConfigAgentEntry = { command: string } | { argv: string[] };
+type ConfigAgentEntry =
+  | { command: string; env?: Record<string, string> }
+  | { argv: string[]; env?: Record<string, string> };
 
 type ConfigFileShape = {
   defaultAgent?: unknown;
@@ -226,9 +229,41 @@ function parseAgentEntry(raw: unknown, name: string, sourcePath: string): Resolv
   if (!isObject(raw)) {
     throw new Error(`Invalid config agents.${name} in ${sourcePath}: expected object with command`);
   }
-  return Object.prototype.hasOwnProperty.call(raw, "argv")
+  const env = parseAgentEnv(raw.env, name, sourcePath);
+  const entry = Object.prototype.hasOwnProperty.call(raw, "argv")
     ? parseArgvAgentEntry(raw, name, sourcePath)
     : parseLegacyAgentEntry(raw, name, sourcePath);
+  return env ? { ...entry, env } : entry;
+}
+
+function parseAgentEnv(
+  value: unknown,
+  agentName: string,
+  sourcePath: string,
+): Record<string, string> | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (!isObject(value)) {
+    throw new Error(
+      `Invalid config agents.${agentName}.env in ${sourcePath}: expected object of string values`,
+    );
+  }
+  const env: Record<string, string> = {};
+  for (const [key, rawValue] of Object.entries(value)) {
+    if (typeof rawValue !== "string") {
+      throw new Error(
+        `Invalid config agents.${agentName}.env.${key} in ${sourcePath}: expected string`,
+      );
+    }
+    if (key.length === 0 || key.includes("=") || key.includes("\0")) {
+      throw new Error(
+        `Invalid config agents.${agentName}.env in ${sourcePath}: invalid environment name ${JSON.stringify(key)}`,
+      );
+    }
+    env[key] = rawValue;
+  }
+  return env;
 }
 
 function parseArgvAgentEntry(
@@ -534,7 +569,9 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
   const agents = Object.fromEntries(
     Object.entries(config.agents).map(([name, agent]) => [
       name,
-      agent.argv ? { argv: [...agent.argv] } : { command: agent.command },
+      agent.argv
+        ? { argv: [...agent.argv], ...(agent.env ? { env: { ...agent.env } } : {}) }
+        : { command: agent.command, ...(agent.env ? { env: { ...agent.env } } : {}) },
     ]),
   );
 

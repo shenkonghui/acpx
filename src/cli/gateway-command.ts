@@ -232,6 +232,7 @@ function resolveGatewayAgent(name: string, config: ResolvedAcpxConfig): GatewayA
       name,
       agentCommand: configuredAgent.command,
       ...(configuredAgent.argv ? { agentArgv: [...configuredAgent.argv] } : {}),
+      ...(configuredAgent.env ? { env: { ...configuredAgent.env } } : {}),
     };
   }
   const agentArgv = resolveAgentArgv(name);

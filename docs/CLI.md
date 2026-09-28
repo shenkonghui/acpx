@@ -27,6 +27,10 @@ acpx [global_options] compare <agent>... '<prompt_text>'
 acpx [global_options] compare <agent>... --file <path>
 acpx [global_options] gateway <agent>... [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] gateway --config <path> [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] registry list [--format <fmt>]
+acpx [global_options] registry show <agent-id> [--format <fmt>]
+acpx [global_options] registry install <agent-id> [--method binary|npx|uvx] [--as <name>] [--force] [--format <fmt>]
+acpx [global_options] registry uninstall <name> [--format <fmt>]
 acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
@@ -339,6 +343,45 @@ acpx [global_options] gateway --config <path> [--cwd <dir>] [--approve-all | --a
   exit `130`. Sessions live in gateway memory for the process lifetime only.
 
 See [Gateway](gateway.md) for the full behavior contract and limitations.
+
+## `registry` subcommand
+
+Discover and install ACP servers from the official ACP agent registry, then run
+them like any other agent:
+
+```bash
+acpx [global_options] registry list [--format <fmt>]
+acpx [global_options] registry show <agent-id> [--format <fmt>]
+acpx [global_options] registry install <agent-id> [--method binary|npx|uvx] [--as <name>] [--force] [--format <fmt>]
+acpx [global_options] registry uninstall <name> [--format <fmt>]
+```
+
+- `list` prints every registry agent with its id, version, and available
+  distribution methods.
+- `show <agent-id>` prints one agent's metadata and the distributions available
+  for the current platform.
+- `install <agent-id>` downloads or records the chosen distribution and writes a
+  matching entry into the global config (`~/.acpx/config.json`).
+- `--method binary|npx|uvx` forces a distribution method instead of the default
+  `binary → npx → uvx` preference.
+- `--as <name>` registers the agent under a different name, which avoids
+  replacing a same-named built-in.
+- `--force` re-downloads even when the same version is already installed.
+- `uninstall <name>` removes the config entry and deletes the install directory.
+- `--format json` prints a single structured document on stdout; progress output
+  is suppressed so stdout stays machine-readable.
+- `ACPX_REGISTRY_URL` overrides the registry URL.
+
+After installing, the agent is available by name:
+
+```bash
+acpx registry install <agent-id>
+acpx <agent-id> sessions new
+acpx <agent-id> 'do the work'
+```
+
+See [Registry](registry.md) for install layout, environment handling, and
+limitations.
 
 ## `compare` subcommand
 

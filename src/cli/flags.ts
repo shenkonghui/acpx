@@ -613,6 +613,7 @@ export function resolveAgentInvocation(
   agentName: string;
   agentCommand: string;
   agentArgv?: string[];
+  agentEnv?: Record<string, string>;
   cwd: string;
 } {
   const override = resolveAgentOverride(globalFlags.agent);
@@ -634,7 +635,7 @@ function resolveInvocationCommand(
   agentName: string,
   override: string | undefined,
   config: ResolvedAcpxConfig,
-): { agentCommand: string; agentArgv?: string[] } {
+): { agentCommand: string; agentArgv?: string[]; agentEnv?: Record<string, string> } {
   if (override !== undefined) {
     return { agentCommand: override };
   }
@@ -649,6 +650,7 @@ function resolveInvocationCommand(
     return {
       agentCommand: configuredAgent.command,
       ...(configuredAgent.argv ? { agentArgv: [...configuredAgent.argv] } : {}),
+      ...(configuredAgent.env ? { agentEnv: { ...configuredAgent.env } } : {}),
     };
   }
   const agentArgv = resolveAgentArgv(agentName);

@@ -41,6 +41,7 @@ export type GatewayAgentSpec = {
   name: string;
   agentCommand: string;
   agentArgv?: string[];
+  env?: Record<string, string>;
 };
 
 export type RunAcpGatewayOptions = {
@@ -264,7 +265,7 @@ function dedupeAgents(agents: GatewayAgentSpec[]): GatewayAgentSpec[] {
   const seen = new Set<string>();
   const unique: GatewayAgentSpec[] = [];
   for (const agent of agents) {
-    const key = JSON.stringify([agent.agentCommand, agent.agentArgv ?? []]);
+    const key = JSON.stringify([agent.agentCommand, agent.agentArgv ?? [], agent.env ?? {}]);
     if (seen.has(key)) {
       continue;
     }
@@ -297,6 +298,7 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
         agentArgv: agent.agentArgv,
         cwd: options.cwd,
         permissionMode: options.permissionMode,
+        ...(agent.env ? { sessionOptions: { env: agent.env } } : {}),
         verbose: options.verbose,
         suppressSdkConsoleErrors: true,
         onSessionUpdate: (notification) => {
