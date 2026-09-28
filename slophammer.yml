@@ -16,6 +16,8 @@ typescript:
       - "node_modules/**"
       - pattern: "examples/flows/replay-viewer/dist/**"
         reason: generated replay-viewer build output
+      - pattern: "examples/acp-chat/dist/**"
+        reason: generated acp-chat build output
     copied_blocks:
       enabled: true
       min_tokens: 100

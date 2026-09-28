@@ -91,7 +91,7 @@ jobs:
           - name: Lint
             command: pnpm run lint
           - name: Build
-            command: pnpm run build && pnpm run viewer:typecheck && pnpm run viewer:build
+            command: pnpm run build && pnpm run viewer:typecheck && pnpm run viewer:build && pnpm run chat:typecheck && pnpm run chat:build
           - name: Conformance Smoke
             command: pnpm run conformance:run -- --case acp.v1.initialize.handshake
           - name: Test

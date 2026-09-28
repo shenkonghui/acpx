@@ -1,0 +1,440 @@
+:root {
+  color-scheme: dark;
+  --bg: #10131a;
+  --panel: #171b24;
+  --panel-strong: #1e2330;
+  --border: #2a3040;
+  --text: #e6e9ef;
+  --muted: #9aa4b8;
+  --accent: #5b8cff;
+  --danger: #ff6b6b;
+  --ok: #4ec9a0;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel-strong);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.button-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #08101f;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+
+.layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.app-header h1 {
+  font-size: 1rem;
+  margin: 0;
+  flex: 1;
+}
+
+.connection {
+  font-size: 0.8rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.connection-on {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.connection-off {
+  color: var(--muted);
+}
+
+.app-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 16rem minmax(0, 1fr) 18rem;
+  min-height: 0;
+}
+
+.sidebar,
+.status-panel {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 0.75rem;
+  overflow-y: auto;
+}
+
+.status-panel {
+  border-right: none;
+  border-left: 1px solid var(--border);
+}
+
+.sidebar h2,
+.status-panel h2 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0.75rem 0 0.4rem;
+}
+
+.sidebar h2:first-child,
+.status-panel h2:first-child {
+  margin-top: 0;
+}
+
+.agent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.agent-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  text-align: left;
+  background: var(--panel-strong);
+}
+
+.agent-item-selected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.agent-line {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.agent-name {
+  font-weight: 600;
+}
+
+.tag {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.35rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.tag-installed {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.tag-missing {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.tag-default {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.cwd-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 1rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.chat-column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.conversation {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.conversation-empty {
+  padding: 1rem;
+}
+
+.bubble {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  background: var(--panel);
+  max-width: 48rem;
+}
+
+.bubble-user {
+  align-self: flex-end;
+  background: var(--panel-strong);
+}
+
+.bubble-assistant {
+  align-self: flex-start;
+}
+
+.bubble-thought {
+  align-self: flex-start;
+  opacity: 0.75;
+  font-style: italic;
+}
+
+.bubble-role {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.bubble-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+}
+
+.streaming-dot::after {
+  content: "▋";
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.tool-card {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  background: #141821;
+  max-width: 48rem;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.tool-title {
+  font-weight: 600;
+}
+
+.tool-text {
+  color: var(--muted);
+  margin: 0.35rem 0;
+}
+
+.tool-card pre,
+.tool-card details pre {
+  overflow-x: auto;
+  font-size: 0.78rem;
+  background: var(--bg);
+  padding: 0.4rem;
+  border-radius: 6px;
+}
+
+.composer {
+  border-top: 1px solid var(--border);
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  background: var(--panel);
+}
+
+.composer-input {
+  resize: vertical;
+  min-height: 3.5rem;
+}
+
+.composer-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.status-list {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.status-list dt {
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 0.5rem;
+}
+
+.status-list dd {
+  margin: 0.1rem 0 0;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.small {
+  font-size: 0.72rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.plan-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
+.command-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: #2a1719;
+  border-bottom: 1px solid var(--danger);
+  padding: 0.5rem 1rem;
+  color: #ffd7d7;
+}
+
+.error-banner ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  flex: 1;
+  font-size: 0.85rem;
+}
+
+.registry-panel,
+.custom-command {
+  margin-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.registry-controls {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.registry-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+  flex: 1;
+}
+
+.registry-controls select,
+.registry-controls input,
+.registry-filter,
+.custom-command input {
+  width: 100%;
+  font-size: 0.8rem;
+}
+
+.registry-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.registry-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.registry-warnings,
+.error-inline {
+  background: #2a1719;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.75rem;
+  color: #ffd7d7;
+}
+
+.registry-warnings ul {
+  margin: 0 0 0.3rem;
+  padding-left: 1rem;
+}
+
+.custom-command code {
+  font-size: 0.7rem;
+}
