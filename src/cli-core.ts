@@ -39,6 +39,7 @@ const TOP_LEVEL_VERBS = new Set([
   "cancel",
   "compare",
   "flow",
+  "gateway",
   "set-mode",
   "set",
   "sessions",

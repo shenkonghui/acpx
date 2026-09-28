@@ -9,6 +9,7 @@ Repo: https://github.com/openclaw/acpx
 ### Changes
 
 - Add an `--acp` flag (`acpx <agent> --acp`, `acpx --agent '<command>' --acp`) that serves the resolved agent as an ACP server over stdio, relaying NDJSON JSON-RPC between an upstream ACP client and the agent process. Devin's scoped Windsurf `initialize` identity and diagnostics-request answers apply while proxying.
+- Add a `gateway` subcommand (`acpx gateway <agent>...`) that serves multiple agents as one ACP server over stdio: every agent starts at gateway startup, `session/new` routes to the agent named in `_meta.acpx.agent` (defaulting to the first agent), and `session/update` notifications relay upstream with gateway session ids. `--config <path>` loads the agent list from a JSON file with friendly per-agent names and an optional default. Thanks @openclaw.
 
 ### Fixes
 

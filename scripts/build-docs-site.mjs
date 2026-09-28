@@ -26,7 +26,7 @@ const installCommand = "npm install -g acpx";
 
 const sections = [
   ["Start", ["index.md", "install.md", "quickstart.md"]],
-  ["Agents", ["agents.md", "custom-agents.md"]],
+  ["Agents", ["agents.md", "custom-agents.md", "gateway.md"]],
   ["Sessions", ["sessions.md", "prompting.md", "session-control.md"]],
   ["Output & Policy", ["output-formats.md", "permissions.md", "config.md"]],
   ["Flows", ["flows.md"]],

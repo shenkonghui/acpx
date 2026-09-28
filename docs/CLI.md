@@ -25,6 +25,8 @@ acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
 acpx [global_options] compare <agent>... '<prompt_text>'
 acpx [global_options] compare <agent>... --file <path>
+acpx [global_options] gateway <agent>... [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway --config <path> [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
@@ -312,6 +314,31 @@ Behavior:
 acpx codex --acp
 acpx --agent './my-custom-server --acp' --acp
 ```
+
+## `gateway` subcommand
+
+Serve multiple agents as one ACP server over stdio. The gateway spawns every
+listed agent at startup, routes each `session/new` to the agent named in
+`_meta.acpx.agent` (defaulting to the first agent), and relays `session/update`
+notifications upstream with gateway session ids:
+
+```bash
+acpx [global_options] gateway <agent>... [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway --config <path> [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
+```
+
+- `--config <path>` loads the agent list from a JSON file (mutually exclusive
+  with positional agents); entries carry a friendly `name` used for
+  `_meta.acpx.agent` selection. See [Gateway](gateway.md) for the file format.
+- Only `--cwd`, `--config`, permission flags, and `--verbose` are accepted;
+  stdout carries ACP protocol traffic only.
+- The first agent (or the entry with `"default": true` in a config file) is the
+  default for sessions created without `_meta`; agent resolution follows
+  [Custom agents](custom-agents.md).
+- Upstream stdin EOF retires all agent processes and exits `0`; SIGINT/SIGTERM
+  exit `130`. Sessions live in gateway memory for the process lifetime only.
+
+See [Gateway](gateway.md) for the full behavior contract and limitations.
 
 ## `compare` subcommand
 
