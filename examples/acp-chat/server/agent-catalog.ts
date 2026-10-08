@@ -1,11 +1,15 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 import {
   listBuiltInAgents,
   normalizeAgentName,
   type AcpAgentInspection,
 } from "../../../src/agent-registry.js";
 import { loadResolvedConfig } from "../../../src/cli/config.js";
-import { parseGatewayConfig } from "../../../src/cli/gateway-command.js";
+import {
+  parseGatewayConfig,
+  resolveGatewayAgentsFromConfig,
+} from "../../../src/cli/gateway-command.js";
 import type { AdHocAgent, LiveAgentRegistry } from "./live-registry.js";
 
 export type AgentAvailability = "installed" | "missing" | "unknown";
@@ -27,6 +31,8 @@ export type AgentSummary = {
   };
   requirements?: AgentRequirement[];
   isDefault: boolean;
+  /** False when the agent is explicitly disabled in config; only settings rows set this. */
+  enabled?: boolean;
 };
 
 export type AgentCatalog = {
@@ -45,9 +51,10 @@ export type AgentCatalogOptions = {
 type ConfigAgentEntry = {
   command: string;
   argv?: string[];
+  env?: Record<string, string>;
 };
 
-type GatewayAgentEntry = {
+export type GatewayAgentEntry = {
   name: string;
   agentCommand: string;
   agentArgv?: string[];
@@ -83,10 +90,12 @@ export class LiveAgentCatalog {
     const collected = collectAgentSources({
       configAgents: config.agents,
       configDefaultAgent: config.defaultAgent,
+      disabledAgents: config.disabledAgents,
       ...(gateway ? { gateway } : {}),
       builtInIds: listBuiltInAgents(),
     });
     this.registry.setConfigOverrides(collected.overrides);
+    this.registry.setConfigEnvs(collected.envs);
 
     return {
       agents: summarizeAgentSources(
@@ -108,6 +117,8 @@ export class LiveAgentCatalog {
 export function collectAgentSources(params: {
   configAgents: Record<string, ConfigAgentEntry>;
   configDefaultAgent: string;
+  /** Normalized names explicitly disabled with `enabled: false`. */
+  disabledAgents?: string[];
   gateway?: {
     agents: GatewayAgentEntry[];
     defaultAgent: string;
@@ -116,26 +127,37 @@ export function collectAgentSources(params: {
 }): {
   sources: AgentSourceEntry[];
   overrides: Record<string, string | string[]>;
+  envs: Record<string, Record<string, string>>;
   defaultAgent: string;
 } {
   const sources: AgentSourceEntry[] = [];
   const overrides: Record<string, string | string[]> = {};
+  const envs: Record<string, Record<string, string>> = {};
   const seen = new Set<string>();
+  const disabled = new Set((params.disabledAgents ?? []).map(normalizeAgentName));
 
-  const add = (id: string, source: AgentSource, override?: string | string[]): void => {
+  const add = (
+    id: string,
+    source: AgentSource,
+    override?: string | string[],
+    env?: Record<string, string>,
+  ): void => {
     const key = normalizeAgentName(id);
-    if (!key || seen.has(key)) {
+    if (!key || seen.has(key) || disabled.has(key)) {
       return;
     }
     seen.add(key);
     if (override !== undefined) {
       overrides[key] = override;
     }
+    if (env && Object.keys(env).length > 0) {
+      envs[key] = { ...env };
+    }
     sources.push({ id, source, ...(override !== undefined ? { override } : {}) });
   };
 
   for (const [name, entry] of Object.entries(params.configAgents)) {
-    add(name, "config", entry.argv ?? entry.command);
+    add(name, "config", entry.argv ?? entry.command, entry.env);
   }
   for (const entry of params.gateway?.agents ?? []) {
     add(entry.name, "gateway-config", entry.agentArgv ?? entry.agentCommand);
@@ -147,6 +169,7 @@ export function collectAgentSources(params: {
   return {
     sources,
     overrides,
+    envs,
     defaultAgent: params.gateway?.defaultAgent ?? params.configDefaultAgent,
   };
 }
@@ -202,7 +225,7 @@ function summarizeAvailability(
   };
 }
 
-async function loadGatewayAgents(
+export async function loadGatewayAgents(
   gatewayConfigPath: string | undefined,
 ): Promise<{ agents: GatewayAgentEntry[]; defaultAgent: string } | undefined> {
   if (!gatewayConfigPath) {
@@ -228,4 +251,43 @@ async function loadGatewayAgents(
   }
   const config = parseGatewayConfig(parsed, gatewayConfigPath);
   return { agents: config.agents, defaultAgent: config.defaultAgent };
+}
+
+/** True when the argv launches an `acpx gateway` process (with or without --config). */
+export function isGatewayLaunch(argv: string[] | undefined): boolean {
+  return Boolean(argv?.some((token) => token === "gateway"));
+}
+
+/**
+ * Backend agent names behind a gateway launch argv, or undefined when the argv
+ * is not a gateway. Legacy `--config <file>` argv reads the JSON file; a plain
+ * gateway argv resolves backends from the main config at `cwd`. Any failure
+ * returns undefined so callers degrade to single-backend probing.
+ */
+export async function detectGatewayBackendNames(
+  argv: string[] | undefined,
+  cwd: string,
+): Promise<string[] | undefined> {
+  if (!argv || !isGatewayLaunch(argv)) {
+    return undefined;
+  }
+  const configIndex = argv.indexOf("--config");
+  if (configIndex >= 0) {
+    const configPath = argv[configIndex + 1];
+    if (!configPath) {
+      return undefined;
+    }
+    try {
+      const raw: unknown = JSON.parse(await fs.readFile(path.resolve(cwd, configPath), "utf8"));
+      return parseGatewayConfig(raw, configPath).agents.map((spec) => spec.name);
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const config = await loadResolvedConfig(cwd);
+    return resolveGatewayAgentsFromConfig(config).agents.map((spec) => spec.name);
+  } catch {
+    return undefined;
+  }
 }

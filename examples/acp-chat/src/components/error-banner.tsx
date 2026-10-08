@@ -20,7 +20,7 @@ export function ErrorBanner({
         ))}
       </ul>
       <button type="button" onClick={onDismiss}>
-        Dismiss
+        关闭
       </button>
     </div>
   );

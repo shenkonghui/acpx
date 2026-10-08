@@ -1,12 +1,28 @@
 import { z } from "zod";
+import { PERMISSION_MODES, type PermissionMode } from "../../../src/types.js";
 
 export const CHAT_PROTOCOL = "acpx.chat.v1";
 
+export type SessionModels = {
+  currentModelId?: string;
+  availableModelIds: string[];
+  availableModels?: Array<{ modelId: string; name: string }>;
+};
+
 export type ChatClientMessage =
   | { type: "hello"; protocol: string }
-  | { type: "open_session"; chatId: string; agent?: string; command?: string; cwd?: string }
+  | {
+      type: "open_session";
+      chatId: string;
+      agent?: string;
+      command?: string;
+      cwd?: string;
+      model?: string;
+      permissionMode?: PermissionMode;
+    }
   | { type: "send"; chatId: string; text: string; requestId: string }
   | { type: "cancel"; chatId: string }
+  | { type: "set_model"; chatId: string; model: string }
   | { type: "close_session"; chatId: string; discard?: boolean }
   | { type: "ping" };
 
@@ -19,13 +35,24 @@ export type ChatErrorCode =
   | "command_disabled"
   | "session_error"
   | "turn_in_progress"
+  | "model_unsupported"
   | "internal_error";
 
 export type ChatServerMessage =
   | { type: "ready"; protocol: typeof CHAT_PROTOCOL }
   | { type: "pong" }
-  | { type: "session_opened"; chatId: string; sessionKey: string; agent: string; cwd: string }
+  | {
+      type: "session_opened";
+      chatId: string;
+      sessionKey: string;
+      agent: string;
+      cwd: string;
+      model?: string;
+      models?: SessionModels;
+      permissionMode?: PermissionMode;
+    }
   | { type: "session_closed"; chatId: string }
+  | { type: "session_models"; chatId: string; models: SessionModels }
   | { type: "turn_started"; chatId: string; requestId: string }
   | {
       type: "text_delta";
@@ -78,6 +105,8 @@ export const chatClientMessageSchema = z.discriminatedUnion("type", [
       agent: z.string().min(1).optional(),
       command: z.string().min(1).optional(),
       cwd: z.string().min(1).optional(),
+      model: z.string().min(1).optional(),
+      permissionMode: z.enum(PERMISSION_MODES).optional(),
     })
     .superRefine((value, ctx) => {
       if ((value.agent === undefined) === (value.command === undefined)) {
@@ -94,6 +123,11 @@ export const chatClientMessageSchema = z.discriminatedUnion("type", [
     requestId: z.string().min(1),
   }),
   z.object({ type: z.literal("cancel"), chatId: z.string().min(1) }),
+  z.object({
+    type: z.literal("set_model"),
+    chatId: z.string().min(1),
+    model: z.string().min(1),
+  }),
   z.object({
     type: z.literal("close_session"),
     chatId: z.string().min(1),

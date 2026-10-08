@@ -3,13 +3,7 @@ import type { TranscriptItem } from "../types.js";
 import { MessageBubble } from "./message-bubble.js";
 import { ToolCallCard } from "./tool-call-card.js";
 
-export function ConversationView({
-  transcript,
-  emptyHint,
-}: {
-  transcript: TranscriptItem[];
-  emptyHint: string;
-}) {
+export function ConversationView({ transcript }: { transcript: TranscriptItem[] }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -17,7 +11,7 @@ export function ConversationView({
   }, [transcript]);
 
   if (transcript.length === 0) {
-    return <p className="muted conversation-empty">{emptyHint}</p>;
+    return null;
   }
 
   return (

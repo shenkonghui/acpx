@@ -25,6 +25,7 @@ export type ChatCliOptions = {
   agentsConfig?: string;
   allowInstall: boolean;
   allowCommand: boolean;
+  allowSettings: boolean;
   open: boolean;
   verbose: boolean;
 };
@@ -40,6 +41,7 @@ Options:
   --agents-config <path>        Extra agents from an acpx gateway --config JSON file
   --no-install                  Disable installing agents from the ACP registry in the page
   --no-command                  Disable running ad-hoc commands from the page
+  --no-settings                 Disable editing the agent config from the page
   --verbose                     Log chat lifecycle events to stderr
   --open                        Open the chat page in a browser after start
   -h, --help                    Show help
@@ -57,6 +59,7 @@ export function parseChatCliArgs(argv: readonly string[]): ChatCliOptions {
   let agentsConfig: string | undefined;
   let allowInstall = true;
   let allowCommand = true;
+  let allowSettings = true;
   let open = false;
   let verbose = false;
 
@@ -86,6 +89,10 @@ export function parseChatCliArgs(argv: readonly string[]): ChatCliOptions {
     }
     if (current === "--no-command") {
       allowCommand = false;
+      continue;
+    }
+    if (current === "--no-settings") {
+      allowSettings = false;
       continue;
     }
     const [flag, inline] = splitInlineFlag(current);
@@ -125,6 +132,7 @@ export function parseChatCliArgs(argv: readonly string[]): ChatCliOptions {
     ...(agentsConfig !== undefined ? { agentsConfig } : {}),
     allowInstall,
     allowCommand,
+    allowSettings,
     open,
     verbose,
   };
@@ -185,6 +193,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
         verbose: options.verbose,
         allowInstall: options.allowInstall,
         allowCommand: options.allowCommand,
+        allowSettings: options.allowSettings,
         ...(options.agentsConfig !== undefined ? { gatewayConfigPath: options.agentsConfig } : {}),
       });
 

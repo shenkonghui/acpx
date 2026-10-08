@@ -1,10 +1,18 @@
-import type { ChatStatusView, LastTurn } from "../types.js";
+import type { ChatStatusView, ChatTurnStatus, LastTurn } from "../types.js";
+
+const TURN_STATUS_LABELS: Record<ChatTurnStatus, string> = {
+  completed: "已完成",
+  cancelled: "已取消",
+  failed: "已失败",
+};
 
 export function StatusPanel({
   connected,
   agent,
   command,
   cwd,
+  model,
+  permissionMode,
   sessionKey,
   activeRequestId,
   lastTurn,
@@ -14,6 +22,8 @@ export function StatusPanel({
   agent?: string;
   command?: string;
   cwd?: string;
+  model?: string;
+  permissionMode?: string;
   sessionKey?: string;
   activeRequestId?: string;
   lastTurn?: LastTurn;
@@ -24,31 +34,41 @@ export function StatusPanel({
 
   return (
     <aside className="status-panel">
-      <h2>Session</h2>
+      <h2>会话</h2>
       <dl className="status-list">
-        <dt>connection</dt>
-        <dd>{connected ? "connected" : "disconnected"}</dd>
+        <dt>连接</dt>
+        <dd>{connected ? "已连接" : "未连接"}</dd>
         <dt>agent</dt>
         <dd>{agent ?? "—"}</dd>
         {command ? (
           <>
-            <dt>command</dt>
+            <dt>命令</dt>
             <dd className="mono small">{command}</dd>
           </>
         ) : null}
-        <dt>cwd</dt>
+        <dt>工作目录</dt>
         <dd className="mono">{cwd ?? "—"}</dd>
-        <dt>state</dt>
-        <dd>{activeRequestId ? "running a turn" : lastTurn ? lastTurn.status : "idle"}</dd>
+        {model ? (
+          <>
+            <dt>模型</dt>
+            <dd className="mono small">{model}</dd>
+          </>
+        ) : null}
+        <dt>权限</dt>
+        <dd>{permissionMode ?? "—"}</dd>
+        <dt>状态</dt>
+        <dd>
+          {activeRequestId ? "正在运行" : lastTurn ? TURN_STATUS_LABELS[lastTurn.status] : "空闲"}
+        </dd>
         {sessionKey ? (
           <>
-            <dt>session</dt>
+            <dt>会话 ID</dt>
             <dd className="mono small">{sessionKey}</dd>
           </>
         ) : null}
         {status.used !== undefined ? (
           <>
-            <dt>context</dt>
+            <dt>上下文</dt>
             <dd>
               {status.size !== undefined ? `${status.used} / ${status.size}` : String(status.used)}
             </dd>
@@ -58,14 +78,14 @@ export function StatusPanel({
 
       {status.text ? (
         <>
-          <h2>Status</h2>
+          <h2>状态</h2>
           <p className="muted">{status.text}</p>
         </>
       ) : null}
 
       {planEntries.length > 0 ? (
         <>
-          <h2>Plan</h2>
+          <h2>计划</h2>
           <ol className="plan-list">
             {planEntries.map((entry, index) => (
               <li key={`${index}-${entry}`}>{entry}</li>
@@ -76,7 +96,7 @@ export function StatusPanel({
 
       {commands.length > 0 ? (
         <>
-          <h2>Commands</h2>
+          <h2>命令</h2>
           <div className="command-chips">
             {commands.map((name) => (
               <span className="tag" key={name}>

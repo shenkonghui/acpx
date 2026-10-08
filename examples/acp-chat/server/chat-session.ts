@@ -15,8 +15,9 @@ import {
 } from "../../../src/runtime.js";
 import { resolveInstalledExecutable } from "../../../src/spawn-command-options.js";
 import type { PermissionMode } from "../../../src/types.js";
-import type { ChatErrorCode, ChatServerMessage } from "./chat-protocol.js";
+import type { ChatErrorCode, ChatServerMessage, SessionModels } from "./chat-protocol.js";
 import type { LiveAgentRegistry } from "./live-registry.js";
+import { readEnabledModels } from "./settings.js";
 
 export type ChatSessionManagerOptions = {
   cwd: string;
@@ -33,18 +34,24 @@ export type OpenSessionInput = {
   chatId: string;
   agent: string;
   cwd?: string;
+  model?: string;
+  permissionMode?: PermissionMode;
 };
 
 export type OpenCommandInput = {
   chatId: string;
   command: string;
   cwd?: string;
+  permissionMode?: PermissionMode;
 };
 
 export type OpenSessionResult = {
   sessionKey: string;
   agent: string;
   cwd: string;
+  permissionMode: PermissionMode;
+  model?: string;
+  models?: SessionModels;
 };
 
 export type SendTurnInput = {
@@ -59,7 +66,13 @@ type ChatSession = {
   cwd: string;
   sessionKey: string;
   handle: AcpRuntimeHandle;
+  /** The runtime instance that owns this session (one per permission mode). */
+  runtime: AcpRuntime;
+  permissionMode: PermissionMode;
   activeTurn?: AcpRuntimeTurn;
+  /** Last model selected through the page or advertised by the agent. */
+  model?: string;
+  models?: SessionModels;
   /** Ad-hoc command sessions register a temporary synthetic agent name. */
   adHoc?: boolean;
 };
@@ -84,22 +97,33 @@ const runtimeFactory: ChatRuntimeFactory = (options) =>
 
 /** Wraps `AcpxRuntime` behind the browser chat protocol (one session per chat id). */
 export class ChatSessionManager {
-  private readonly runtime: AcpRuntime;
+  /** One runtime per permission mode, created lazily on first use. */
+  private readonly runtimes = new Map<PermissionMode, AcpRuntime>();
   private readonly sessions = new Map<string, ChatSession>();
   private readonly emitters = new Map<string, (message: ChatServerMessage) => void>();
+  private readonly createRuntime: ChatRuntimeFactory;
   private closed = false;
 
   constructor(
     private readonly options: ChatSessionManagerOptions,
     createRuntime: ChatRuntimeFactory = runtimeFactory,
   ) {
-    this.runtime = createRuntime({
-      cwd: options.cwd,
-      stateDir: options.stateDir,
-      permissionMode: options.permissionMode,
-      agentRegistry: options.registry,
-      verbose: options.verbose === true,
-    });
+    this.createRuntime = createRuntime;
+  }
+
+  private runtimeFor(mode: PermissionMode): AcpRuntime {
+    let runtime = this.runtimes.get(mode);
+    if (!runtime) {
+      runtime = this.createRuntime({
+        cwd: this.options.cwd,
+        stateDir: this.options.stateDir,
+        permissionMode: mode,
+        agentRegistry: this.options.registry,
+        verbose: this.options.verbose === true,
+      });
+      this.runtimes.set(mode, runtime);
+    }
+    return runtime;
   }
 
   attach(chatId: string, emit: (message: ChatServerMessage) => void): void {
@@ -115,7 +139,14 @@ export class ChatSessionManager {
       this.emitError(input.chatId, "agent_not_found", `Unknown agent: ${input.agent}`);
       return undefined;
     }
-    return await this.openResolvedSession(input.chatId, input.agent, input.cwd);
+    return await this.openResolvedSession(
+      input.chatId,
+      input.agent,
+      input.cwd,
+      false,
+      input.model,
+      input.permissionMode,
+    );
   }
 
   /**
@@ -151,7 +182,14 @@ export class ChatSessionManager {
 
     const agent = adHocAgentName(input.chatId);
     this.options.registry.registerAdHoc(agent, [executable, ...parsed.args]);
-    const opened = await this.openResolvedSession(input.chatId, agent, input.cwd, true);
+    const opened = await this.openResolvedSession(
+      input.chatId,
+      agent,
+      input.cwd,
+      true,
+      undefined,
+      input.permissionMode,
+    );
     if (!opened) {
       this.options.registry.removeAdHoc(agent);
     }
@@ -163,28 +201,55 @@ export class ChatSessionManager {
     agent: string,
     requestedCwd: string | undefined,
     adHoc = false,
+    model?: string,
+    permissionMode?: PermissionMode,
   ): Promise<OpenSessionResult | undefined> {
     const cwd = path.resolve(requestedCwd?.trim() || this.options.cwd);
     const normalized = normalizeAgentName(agent);
+    const mode = permissionMode ?? this.options.permissionMode;
+    const runtime = this.runtimeFor(mode);
 
     const existing = this.sessions.get(chatId);
-    if (existing && normalizeAgentName(existing.agent) === normalized && existing.cwd === cwd) {
-      return this.describe(existing);
-    }
-    if (existing?.activeTurn) {
-      this.emitError(chatId, "session_error", "Cannot switch agent while a turn is running");
-      return undefined;
+    if (existing) {
+      if (existing.activeTurn) {
+        this.emitError(chatId, "session_error", "Cannot switch session while a turn is running");
+        return undefined;
+      }
+      if (
+        normalizeAgentName(existing.agent) === normalized &&
+        existing.cwd === cwd &&
+        existing.permissionMode === mode
+      ) {
+        // Re-read the model list so config-side enabledModels changes are
+        // reflected without restarting the session.
+        await this.refreshSessionModels(existing);
+        return this.describe(existing);
+      }
+      // Agent, cwd, or permission mode changed: drop the previous runtime
+      // session so the new one actually starts under the requested mode.
+      await existing.runtime
+        .close({ handle: existing.handle, reason: "chat_closed" })
+        .catch((error: unknown) => {
+          this.log(`close on switch failed: ${errorMessage(error)}`);
+        });
+      if (existing.adHoc) {
+        this.options.registry.removeAdHoc(existing.agent);
+      }
     }
 
-    const sessionKey = `agent:${agent}:web:${chatId}`;
+    // The key carries the mode so a runtime never reattaches to a session that
+    // was created under a different permission mode.
+    const sessionKey = `agent:${agent}:web:${chatId}:${mode}`;
+    const env = this.options.registry.resolveEnv(agent);
     try {
       const handle =
-        (await this.runtime.findSession?.({ sessionKey, agent })) ??
-        (await this.runtime.ensureSession({
+        (await runtime.findSession?.({ sessionKey, agent })) ??
+        (await runtime.ensureSession({
           sessionKey,
           agent,
           mode: "persistent",
           cwd,
+          ...(env ? { sessionOptions: { env } } : {}),
         }));
       const session: ChatSession = {
         chatId,
@@ -192,8 +257,17 @@ export class ChatSessionManager {
         cwd,
         sessionKey,
         handle,
+        runtime,
+        permissionMode: mode,
         ...(adHoc ? { adHoc: true } : {}),
       };
+      if (model !== undefined) {
+        await this.applyModel(session, model);
+      }
+      session.models = await this.readModels(session);
+      if (session.models?.currentModelId !== undefined) {
+        session.model = session.models.currentModelId;
+      }
       this.sessions.set(chatId, session);
       return this.describe(session);
     } catch (error) {
@@ -215,7 +289,7 @@ export class ChatSessionManager {
 
     let turn: AcpRuntimeTurn;
     try {
-      turn = this.runtime.startTurn({
+      turn = session.runtime.startTurn({
         handle: session.handle,
         text: input.text,
         mode: "prompt",
@@ -286,6 +360,57 @@ export class ChatSessionManager {
     await turn.cancel({ reason: "user" });
   }
 
+  /** Changes the model of an open session. Rejected while a turn is running. */
+  async setModel(chatId: string, model: string): Promise<void> {
+    const session = this.sessions.get(chatId);
+    if (!session) {
+      this.emitError(chatId, "session_error", "No open session for this chat");
+      return;
+    }
+    if (session.activeTurn) {
+      this.emitError(chatId, "turn_in_progress", "Cannot change the model while a turn is running");
+      return;
+    }
+    if (!(await this.applyModel(session, model))) {
+      return;
+    }
+    const models = (await this.readModels(session)) ?? {
+      currentModelId: model,
+      availableModelIds: [],
+    };
+    session.models = models;
+    this.emit({ type: "session_models", chatId, models });
+  }
+
+  /**
+   * Re-reads and re-broadcasts the model list for every live session using
+   * `agent` (e.g. after its `enabledModels` config changed in settings).
+   */
+  async refreshModelsForAgent(agent: string): Promise<void> {
+    const normalized = normalizeAgentName(agent);
+    for (const session of this.sessions.values()) {
+      if (normalizeAgentName(session.agent) === normalized) {
+        await this.refreshSessionModels(session);
+      }
+    }
+  }
+
+  /** Refreshes one session's cached model list and pushes it to the client. */
+  private async refreshSessionModels(session: ChatSession): Promise<void> {
+    const models = await this.readModels(session);
+    if (!models) {
+      return;
+    }
+    session.models = models;
+    if (models.currentModelId !== undefined) {
+      session.model = models.currentModelId;
+    } else if (session.model !== undefined && !models.availableModelIds.includes(session.model)) {
+      // The active model was filtered out; let the picker fall back.
+      delete session.model;
+    }
+    this.emit({ type: "session_models", chatId: session.chatId, models });
+  }
+
   async closeSession(chatId: string, discard = false): Promise<void> {
     const session = this.sessions.get(chatId);
     if (!session) {
@@ -298,7 +423,7 @@ export class ChatSessionManager {
       });
     }
     try {
-      await this.runtime.close({
+      await session.runtime.close({
         handle: session.handle,
         reason: "chat_closed",
         ...(discard ? { discardPersistentState: true } : {}),
@@ -322,11 +447,75 @@ export class ChatSessionManager {
     }
     this.sessions.clear();
     this.emitters.clear();
-    await this.runtime.shutdown?.();
+    for (const runtime of this.runtimes.values()) {
+      await runtime.shutdown?.();
+    }
   }
 
   private describe(session: ChatSession): OpenSessionResult {
-    return { sessionKey: session.sessionKey, agent: session.agent, cwd: session.cwd };
+    return {
+      sessionKey: session.sessionKey,
+      agent: session.agent,
+      cwd: session.cwd,
+      permissionMode: session.permissionMode,
+      ...(session.model !== undefined ? { model: session.model } : {}),
+      ...(session.models !== undefined ? { models: session.models } : {}),
+    };
+  }
+
+  /** Applies a model to the runtime; emits `model_unsupported` and returns false on failure. */
+  private async applyModel(session: ChatSession, model: string): Promise<boolean> {
+    if (!session.runtime.setModel) {
+      this.emitError(session.chatId, "model_unsupported", "This runtime cannot change the model");
+      return false;
+    }
+    try {
+      await session.runtime.setModel({ handle: session.handle, model });
+      session.model = model;
+      return true;
+    } catch (error) {
+      this.emitError(session.chatId, "model_unsupported", errorMessage(error));
+      return false;
+    }
+  }
+
+  private async readModels(session: ChatSession): Promise<SessionModels | undefined> {
+    if (!session.runtime.getStatus) {
+      return undefined;
+    }
+    try {
+      const status = await session.runtime.getStatus({ handle: session.handle });
+      const models = status.models;
+      if (!models) {
+        return undefined;
+      }
+      const enabled = await readEnabledModels(session.agent).catch(() => undefined);
+      const allowed = enabled && enabled.length > 0 ? new Set(enabled) : undefined;
+      const keep = (modelId: string): boolean => allowed === undefined || allowed.has(modelId);
+      // Drop currentModelId when the filter removed it so the picker falls
+      // back to the first available option instead of showing a blank select.
+      const currentKept =
+        models.currentModelId !== undefined && keep(models.currentModelId)
+          ? { currentModelId: models.currentModelId }
+          : {};
+      return {
+        ...currentKept,
+        availableModelIds: models.availableModelIds.filter(keep),
+        ...(models.availableModels
+          ? {
+              availableModels: models.availableModels
+                .filter((model) => keep(model.modelId))
+                .map((model) => ({
+                  modelId: model.modelId,
+                  name: model.name,
+                })),
+            }
+          : {}),
+      };
+    } catch (error) {
+      this.log(`getStatus failed: ${errorMessage(error)}`);
+      return undefined;
+    }
   }
 
   private async forwardEvents(input: SendTurnInput, turn: AcpRuntimeTurn): Promise<void> {

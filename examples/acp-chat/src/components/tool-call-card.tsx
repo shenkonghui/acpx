@@ -4,19 +4,19 @@ export function ToolCallCard({ item }: { item: Extract<TranscriptItem, { kind: "
   return (
     <article className="tool-card">
       <header className="tool-head">
-        <span className="tool-title">{item.title ?? item.toolKind ?? "tool call"}</span>
+        <span className="tool-title">{item.title ?? item.toolKind ?? "工具调用"}</span>
         {item.status ? <span className={`tag tag-tool-${item.status}`}>{item.status}</span> : null}
       </header>
       {item.text ? <p className="tool-text">{item.text}</p> : null}
       {item.rawInput !== undefined ? (
         <details>
-          <summary>input</summary>
+          <summary>输入</summary>
           <pre>{formatJson(item.rawInput)}</pre>
         </details>
       ) : null}
       {item.rawOutput !== undefined ? (
         <details>
-          <summary>output</summary>
+          <summary>输出</summary>
           <pre>{formatJson(item.rawOutput)}</pre>
         </details>
       ) : null}

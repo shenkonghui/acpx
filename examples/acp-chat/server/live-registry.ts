@@ -9,6 +9,8 @@ import {
 
 export type ConfigOverrides = Record<string, string | string[]>;
 
+export type ConfigEnvs = Record<string, Record<string, string>>;
+
 export type AdHocAgent = {
   name: string;
   argv: string[];
@@ -22,6 +24,9 @@ export type AdHocAgent = {
 export interface LiveAgentRegistry extends AcpInspectableAgentRegistry {
   has(name: string): boolean;
   setConfigOverrides(overrides: ConfigOverrides): void;
+  /** Per-agent environment variables from config, applied to spawned sessions. */
+  setConfigEnvs(envs: ConfigEnvs): void;
+  resolveEnv(name: string): Record<string, string> | undefined;
   registerAdHoc(name: string, argv: string[]): void;
   removeAdHoc(name: string): void;
   listAdHoc(): AdHocAgent[];
@@ -29,6 +34,7 @@ export interface LiveAgentRegistry extends AcpInspectableAgentRegistry {
 
 export class MutableAgentRegistry implements LiveAgentRegistry {
   private configOverrides: ConfigOverrides = {};
+  private configEnvs: ConfigEnvs = {};
   private readonly adHoc = new Map<string, string[]>();
   private delegate: AcpInspectableAgentRegistry;
 
@@ -39,6 +45,17 @@ export class MutableAgentRegistry implements LiveAgentRegistry {
   setConfigOverrides(overrides: ConfigOverrides): void {
     this.configOverrides = { ...overrides };
     this.rebuild();
+  }
+
+  setConfigEnvs(envs: ConfigEnvs): void {
+    this.configEnvs = Object.fromEntries(
+      Object.entries(envs).map(([name, env]) => [normalizeAgentName(name), { ...env }]),
+    );
+  }
+
+  resolveEnv(name: string): Record<string, string> | undefined {
+    const env = this.configEnvs[normalizeAgentName(name)];
+    return env ? { ...env } : undefined;
   }
 
   registerAdHoc(name: string, argv: string[]): void {

@@ -21,7 +21,7 @@ export function useAgentCatalog(): AgentCatalogState {
       try {
         const response = await fetch("/api/agents");
         if (!response.ok) {
-          throw new Error(`Failed to load agents: ${response.status}`);
+          throw new Error(`加载 agent 列表失败：${response.status}`);
         }
         const payload = (await response.json()) as { agents: AgentSummary[] };
         if (!cancelled) {

@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
-import type { ChatServerCapabilities } from "../types.js";
+import type { ChatServerCapabilities, ChatHealthResponse } from "../types.js";
+
+export type ServerInfo = {
+  capabilities: ChatServerCapabilities;
+  cwd: string;
+  permissionMode: string;
+};
 
 /**
- * Reads the server's advertised capabilities from `/api/health`. Returns undefined
- * until the first successful response so callers can avoid showing disabled features.
+ * Reads `/api/health` for the feature switches plus the server default cwd and
+ * permission mode. Returns undefined until the first successful response.
  */
-export function useServerCapabilities(): ChatServerCapabilities | undefined {
-  const [capabilities, setCapabilities] = useState<ChatServerCapabilities | undefined>(undefined);
+export function useServerCapabilities(): ServerInfo | undefined {
+  const [info, setInfo] = useState<ServerInfo | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -16,12 +22,16 @@ export function useServerCapabilities(): ChatServerCapabilities | undefined {
         if (!response.ok) {
           return;
         }
-        const payload = (await response.json()) as { capabilities?: ChatServerCapabilities };
+        const payload = (await response.json()) as ChatHealthResponse;
         if (!cancelled && payload.capabilities) {
-          setCapabilities(payload.capabilities);
+          setInfo({
+            capabilities: payload.capabilities,
+            cwd: payload.cwd,
+            permissionMode: payload.permissionMode,
+          });
         }
       } catch {
-        // Leave capabilities undefined; the page still works read-only.
+        // Leave info undefined; the page still works read-only.
       }
     })();
     return () => {
@@ -29,5 +39,5 @@ export function useServerCapabilities(): ChatServerCapabilities | undefined {
     };
   }, []);
 
-  return capabilities;
+  return info;
 }

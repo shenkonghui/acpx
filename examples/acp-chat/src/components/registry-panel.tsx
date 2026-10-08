@@ -6,6 +6,7 @@ type MethodChoice = "auto" | RegistryInstallMethod;
 
 const METHOD_CHOICES: MethodChoice[] = ["auto", "binary", "npx", "uvx"];
 
+/** "Add Provider"-style catalog of installable ACP registry agents. */
 export function RegistryPanel({ onInstalled }: { onInstalled?: () => void }) {
   const registry = useRegistry(onInstalled);
   const [method, setMethod] = useState<MethodChoice>("auto");
@@ -38,11 +39,9 @@ export function RegistryPanel({ onInstalled }: { onInstalled?: () => void }) {
 
   return (
     <section className="registry-panel">
-      <h2>ACP registry</h2>
-
       <div className="registry-controls">
         <label>
-          <span>method</span>
+          <span>安装方式</span>
           <select
             value={method}
             disabled={installing}
@@ -56,80 +55,94 @@ export function RegistryPanel({ onInstalled }: { onInstalled?: () => void }) {
           </select>
         </label>
         <label>
-          <span>alias</span>
+          <span>别名</span>
           <input
             type="text"
             value={asName}
-            placeholder="(agent id)"
+            placeholder="（agent id）"
             disabled={installing}
             onChange={(event) => setAsName(event.target.value)}
           />
         </label>
       </div>
 
-      <input
-        className="registry-filter"
-        type="text"
-        value={filter}
-        placeholder="Filter registry…"
-        onChange={(event) => setFilter(event.target.value)}
-      />
+      <div className="settings-search">
+        <input
+          type="text"
+          value={filter}
+          placeholder="搜索 provider…"
+          onChange={(event) => setFilter(event.target.value)}
+        />
+      </div>
 
       {registry.error ? <p className="error-inline">{registry.error}</p> : null}
       {registry.installError ? (
         <p className="error-inline" role="alert">
           {registry.installError}{" "}
-          <button type="button" onClick={registry.dismissInstallError}>
-            Dismiss
+          <button type="button" className="button-outline" onClick={registry.dismissInstallError}>
+            关闭
           </button>
         </p>
       ) : null}
       {registry.warnings.length > 0 ? (
-        <div className="registry-warnings" role="status">
+        <div className="error-inline" role="status">
           <ul>
             {registry.warnings.map((warning) => (
               <li key={warning}>{warning}</li>
             ))}
           </ul>
-          <button type="button" onClick={registry.dismissWarnings}>
-            Dismiss
+          <button type="button" className="button-outline" onClick={registry.dismissWarnings}>
+            关闭
           </button>
         </div>
       ) : null}
 
       {registry.loading ? (
-        <p className="muted">Loading registry…</p>
+        <p className="muted small">正在加载 registry…</p>
       ) : (
-        <ul className="registry-list">
+        <ul className="settings-group">
           {visibleAgents.map((agent) => {
             const busy = registry.installingId === agent.id;
+            const initial = agent.name.charAt(0).toUpperCase() || "?";
             return (
-              <li key={agent.id}>
-                <div className="registry-line">
-                  <span className="agent-name">{agent.name}</span>
-                  <span className="tag">{agent.version}</span>
+              <li className="settings-row" key={agent.id}>
+                <div className="settings-row-body">
+                  <span className="row-avatar" aria-hidden="true">
+                    {initial}
+                  </span>
+                  <span className="row-main">
+                    <span className="row-title">
+                      {agent.name}
+                      <span className="row-title-meta">{agent.version}</span>
+                      {agent.installed ? <span className="tag tag-installed">已安装</span> : null}
+                    </span>
+                    {agent.description ? (
+                      <span className="row-desc">{agent.description}</span>
+                    ) : null}
+                    <span className="registry-methods">
+                      {agent.methods.length > 0 ? (
+                        agent.methods.map((entry) => (
+                          <span className="tag" key={entry}>
+                            {entry}
+                          </span>
+                        ))
+                      ) : (
+                        <span className="tag tag-missing">不支持</span>
+                      )}
+                    </span>
+                  </span>
+                  <span className="row-actions">
+                    <button
+                      type="button"
+                      className={agent.installed ? "button-outline" : "button-primary"}
+                      disabled={installing || (!agent.installed && !agent.installable)}
+                      onClick={() => runInstall(agent.id)}
+                      title={`registry id: ${agent.id}`}
+                    >
+                      {busy ? "安装中…" : agent.installed ? "重新安装" : "安装"}
+                    </button>
+                  </span>
                 </div>
-                <div className="registry-line">
-                  {agent.methods.length > 0 ? (
-                    agent.methods.map((entry) => (
-                      <span className="tag" key={entry}>
-                        {entry}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="tag tag-missing">unsupported</span>
-                  )}
-                  {agent.installed ? <span className="tag tag-installed">installed</span> : null}
-                  <button
-                    type="button"
-                    disabled={installing || (!agent.installed && !agent.installable)}
-                    onClick={() => runInstall(agent.id)}
-                    title={`registry id: ${agent.id}`}
-                  >
-                    {busy ? "Installing…" : agent.installed ? "Reinstall" : "Install"}
-                  </button>
-                </div>
-                {agent.description ? <p className="muted small">{agent.description}</p> : null}
               </li>
             );
           })}

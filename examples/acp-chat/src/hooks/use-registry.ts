@@ -40,7 +40,7 @@ export function useRegistry(onInstalled?: () => void): RegistryState {
       try {
         const response = await fetch("/api/registry");
         if (!response.ok) {
-          throw new Error(`Failed to load the ACP registry: ${response.status}`);
+          throw new Error(`加载 ACP registry 失败：${response.status}`);
         }
         const payload = (await response.json()) as { agents: RegistryAgentSummary[] };
         if (!cancelled) {
@@ -80,7 +80,7 @@ export function useRegistry(onInstalled?: () => void): RegistryState {
           | { result?: RegistryInstallResult; error?: { message?: string } }
           | undefined;
         if (!response.ok || !payload?.result) {
-          throw new Error(payload?.error?.message ?? `Install failed: ${response.status}`);
+          throw new Error(payload?.error?.message ?? `安装失败：${response.status}`);
         }
         setWarnings(payload.result.warnings);
         setReloadToken((token) => token + 1);

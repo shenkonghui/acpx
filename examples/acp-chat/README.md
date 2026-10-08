@@ -5,6 +5,10 @@ agent, send a prompt, watch the turn stream, and cancel it. It talks to the
 in-process `AcpxRuntime` through a small HTTP + WebSocket server, so it exercises
 the same session, event, and permission code paths as the CLI.
 
+The page also manages the agent config: a **Settings** view enables/disables
+agents, edits their launch command and `env`, and writes `~/.acpx/config.json`.
+The chat view runs several sessions at once and can switch the model per session.
+
 For the behaviour contract and protocol details, see
 [docs/2026-09-28-acp-chat-viewer.md](../../docs/2026-09-28-acp-chat-viewer.md).
 
@@ -71,6 +75,32 @@ The command is registered under a synthetic per-chat agent name and removed when
 the chat closes. Ad-hoc sessions are process-local and do not survive a server
 restart. Pass `--no-command` to disable it.
 
+## Sessions and models
+
+One WebSocket carries many sessions. The sidebar lets you start a new session
+(pick an agent or a custom command), switch between sessions, and close one.
+Each session remembers its own agent, working directory, and model, and the list
+is persisted in `localStorage` so a reload reattaches to the same sessions.
+
+The model picker shows the models the agent advertises for the selected session.
+Picking a new model changes that session only; the choice is rejected while a
+turn is running, and agents that cannot change models report the limitation
+instead of failing silently.
+
+## Settings
+
+The **Settings** view lists every agent the server knows about — including ones
+you have disabled. From here you can:
+
+- toggle an agent on or off (disabled agents vanish from the chat catalog)
+- edit the launch command (parsed into an `argv` array) and `env`
+- reset a built-in back to its default command
+- remove an agent entry
+
+Changes are written to `~/.acpx/config.json` with a read-modify-write that keeps
+unrelated keys intact. Pass `--no-settings` to make the view read-only and reject
+every change with `403`.
+
 ## Options
 
 ```text
@@ -82,6 +112,7 @@ restart. Pass `--no-command` to disable it.
 --agents-config <path>        extra agents from an acpx gateway --config JSON file
 --no-install                  disable registry installs from the page
 --no-command                  disable ad-hoc commands from the page
+--no-settings                 disable editing ~/.acpx/config.json from the page
 --verbose                     log chat lifecycle events to stderr
 --open                        open the page in a browser after start
 ```
@@ -98,6 +129,7 @@ may omit `Origin`. There is no authentication and no interactive permission
 prompt in the browser, so keep the default loopback bind.
 
 Registry installs download files and write `~/.acpx/config.json`; ad-hoc commands
-execute arbitrary local programs. Both are enabled by default for this local
-harness; disable them with `--no-install` / `--no-command`, especially when the
-server is bound to a non-loopback host.
+execute arbitrary local programs; the settings view also writes
+`~/.acpx/config.json`. All three are enabled by default for this local harness;
+disable them with `--no-install` / `--no-command` / `--no-settings`, especially
+when the server is bound to a non-loopback host.

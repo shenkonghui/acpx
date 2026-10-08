@@ -1,22 +1,43 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
-import { createInitialChatState, reduceChatState } from "../lib/chat-reducer.js";
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import {
+  createInitialSessionsState,
+  reduceSessionsState,
+  type SessionsState,
+} from "../lib/chat-reducer.js";
 import { ChatSocketClient } from "../lib/chat-socket.js";
-import type { ChatState } from "../types.js";
+import {
+  loadStoredSessions,
+  saveStoredSessions,
+  type StoredSession,
+} from "../lib/session-store.js";
+import type { ChatState, PermissionMode } from "../types.js";
+
+export type OpenChatOptions = {
+  cwd?: string;
+  model?: string;
+  permissionMode?: PermissionMode;
+  /** Reuse an existing chat id instead of creating a new one (reattach). */
+  chatId?: string;
+};
 
 export type ChatSocketState = {
-  state: ChatState;
-  openChat: (agent: string, cwd?: string) => void;
-  openCommand: (command: string, cwd?: string) => void;
-  send: (text: string) => boolean;
-  cancel: () => void;
-  closeChat: (discard?: boolean) => void;
-  dismissErrors: () => void;
+  state: SessionsState;
+  openChat: (agent: string, options?: OpenChatOptions) => string;
+  openCommand: (command: string, options?: OpenChatOptions) => string;
+  send: (chatId: string, text: string) => boolean;
+  cancel: (chatId: string) => void;
+  closeChat: (chatId: string, discard?: boolean) => void;
+  setModel: (chatId: string, model: string) => void;
+  selectSession: (chatId: string) => void;
+  dismissErrors: (chatId?: string) => void;
 };
 
 type PendingOpen = {
   agent?: string;
   command?: string;
   cwd?: string;
+  model?: string;
+  permissionMode?: PermissionMode;
 };
 
 // `crypto.randomUUID` is only available in secure contexts, so the page throws
@@ -31,24 +52,35 @@ function createClientId(): string {
 }
 
 export function useChatSocket(): ChatSocketState {
-  const chatId = useMemo(() => createClientId(), []);
-  const [state, dispatch] = useReducer(reduceChatState, chatId, createInitialChatState);
+  const [state, dispatch] = useReducer(reduceSessionsState, undefined, () =>
+    createInitialSessionsState(loadStoredSessions()),
+  );
   const socketRef = useRef<ChatSocketClient | null>(null);
-  const pendingOpenRef = useRef<PendingOpen | null>(null);
+  const desiredRef = useRef<Map<string, PendingOpen> | null>(null);
+  const persistedRef = useRef<string>("");
+
+  // Seed the "wanted" sessions from any restored ones so a reload reattaches.
+  if (desiredRef.current === null) {
+    const desired = new Map<string, PendingOpen>();
+    for (const chatId of state.order) {
+      const spec = toPendingOpen(state.sessions[chatId]);
+      if (spec) {
+        desired.set(chatId, spec);
+      }
+    }
+    desiredRef.current = desired;
+  }
 
   const flushOpen = useCallback(() => {
-    const pending = pendingOpenRef.current;
-    if (!pending) {
+    const client = socketRef.current;
+    const desired = desiredRef.current;
+    if (!client || !desired) {
       return;
     }
-    socketRef.current?.send({
-      type: "open_session",
-      chatId,
-      ...(pending.agent !== undefined ? { agent: pending.agent } : {}),
-      ...(pending.command !== undefined ? { command: pending.command } : {}),
-      ...(pending.cwd ? { cwd: pending.cwd } : {}),
-    });
-  }, [chatId]);
+    for (const [chatId, spec] of desired) {
+      client.send({ type: "open_session", chatId, ...spec });
+    }
+  }, []);
 
   useEffect(() => {
     const client = new ChatSocketClient({
@@ -64,49 +96,155 @@ export function useChatSocket(): ChatSocketState {
     };
   }, [flushOpen]);
 
-  const openChat = useCallback(
-    (agent: string, cwd?: string) => {
-      pendingOpenRef.current = { agent, ...(cwd ? { cwd } : {}) };
-      dispatch({ type: "opening", agent, ...(cwd ? { cwd } : {}) });
-      flushOpen();
-    },
-    [flushOpen],
-  );
+  // Persist identity only (never transcripts); skip writes when nothing changed.
+  const stored = buildStoredSessions(state);
+  const serialized = JSON.stringify(stored);
+  useEffect(() => {
+    if (persistedRef.current === serialized) {
+      return;
+    }
+    persistedRef.current = serialized;
+    saveStoredSessions(stored);
+  }, [serialized, stored]);
 
-  const openCommand = useCallback(
-    (command: string, cwd?: string) => {
-      pendingOpenRef.current = { command, ...(cwd ? { cwd } : {}) };
-      dispatch({ type: "opening", command, ...(cwd ? { cwd } : {}) });
-      flushOpen();
-    },
-    [flushOpen],
-  );
+  const openChat = useCallback((agent: string, options: OpenChatOptions = {}) => {
+    const chatId = options.chatId ?? createClientId();
+    const spec: PendingOpen = {
+      agent,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
+    };
+    desiredRef.current?.set(chatId, spec);
+    dispatch({
+      type: "opening",
+      chatId,
+      agent,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
+    });
+    dispatch({ type: "select_session", chatId });
+    socketRef.current?.send({ type: "open_session", chatId, ...spec });
+    return chatId;
+  }, []);
 
-  const send = useCallback(
-    (text: string) => {
-      const requestId = createClientId();
-      const sent = socketRef.current?.send({ type: "send", chatId, text, requestId }) ?? false;
-      if (sent) {
-        dispatch({ type: "user_message", requestId, text });
-      }
-      return sent;
-    },
-    [chatId],
-  );
+  const openCommand = useCallback((command: string, options: OpenChatOptions = {}) => {
+    const chatId = options.chatId ?? createClientId();
+    const spec: PendingOpen = {
+      command,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
+    };
+    desiredRef.current?.set(chatId, spec);
+    dispatch({
+      type: "opening",
+      chatId,
+      command,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
+    });
+    dispatch({ type: "select_session", chatId });
+    socketRef.current?.send({ type: "open_session", chatId, ...spec });
+    return chatId;
+  }, []);
 
-  const cancel = useCallback(() => {
+  const send = useCallback((chatId: string, text: string) => {
+    const requestId = createClientId();
+    const sent = socketRef.current?.send({ type: "send", chatId, text, requestId }) ?? false;
+    if (sent) {
+      dispatch({ type: "user_message", chatId, requestId, text });
+    }
+    return sent;
+  }, []);
+
+  const cancel = useCallback((chatId: string) => {
     socketRef.current?.send({ type: "cancel", chatId });
-  }, [chatId]);
+  }, []);
 
-  const closeChat = useCallback(
-    (discard = false) => {
-      pendingOpenRef.current = null;
-      socketRef.current?.send({ type: "close_session", chatId, discard });
-    },
-    [chatId],
-  );
+  const closeChat = useCallback((chatId: string, discard = false) => {
+    desiredRef.current?.delete(chatId);
+    socketRef.current?.send({ type: "close_session", chatId, discard });
+    dispatch({ type: "session_removed", chatId });
+  }, []);
 
-  const dismissErrors = useCallback(() => dispatch({ type: "clear_errors" }), []);
+  const setModel = useCallback((chatId: string, model: string) => {
+    socketRef.current?.send({ type: "set_model", chatId, model });
+  }, []);
 
-  return { state, openChat, openCommand, send, cancel, closeChat, dismissErrors };
+  const selectSession = useCallback((chatId: string) => {
+    dispatch({ type: "select_session", chatId });
+  }, []);
+
+  const dismissErrors = useCallback((chatId?: string) => {
+    dispatch({ type: "clear_errors", ...(chatId !== undefined ? { chatId } : {}) });
+  }, []);
+
+  return {
+    state,
+    openChat,
+    openCommand,
+    send,
+    cancel,
+    closeChat,
+    setModel,
+    selectSession,
+    dismissErrors,
+  };
+}
+
+function toPendingOpen(session: ChatState | undefined): PendingOpen | undefined {
+  if (!session) {
+    return undefined;
+  }
+  if (session.agent) {
+    return {
+      agent: session.agent,
+      ...(session.cwd ? { cwd: session.cwd } : {}),
+      ...(session.model ? { model: session.model } : {}),
+      ...(session.permissionMode ? { permissionMode: session.permissionMode } : {}),
+    };
+  }
+  if (session.command) {
+    return {
+      command: session.command,
+      ...(session.cwd ? { cwd: session.cwd } : {}),
+      ...(session.permissionMode ? { permissionMode: session.permissionMode } : {}),
+    };
+  }
+  return undefined;
+}
+
+function toStoredSession(
+  chatId: string,
+  session: ChatState | undefined,
+): StoredSession | undefined {
+  if (!session || (!session.agent && !session.command)) {
+    return undefined;
+  }
+  return {
+    chatId,
+    ...(session.agent ? { agent: session.agent } : {}),
+    ...(session.command ? { command: session.command } : {}),
+    ...(session.model ? { model: session.model } : {}),
+    ...(session.cwd ? { cwd: session.cwd } : {}),
+    ...(session.permissionMode ? { permissionMode: session.permissionMode } : {}),
+  };
+}
+
+function buildStoredSessions(state: SessionsState): {
+  sessions: StoredSession[];
+  activeChatId?: string;
+} {
+  const sessions: StoredSession[] = [];
+  for (const chatId of state.order) {
+    const entry = toStoredSession(chatId, state.sessions[chatId]);
+    if (entry) {
+      sessions.push(entry);
+    }
+  }
+  return {
+    sessions,
+    ...(state.activeChatId !== undefined ? { activeChatId: state.activeChatId } : {}),
+  };
 }

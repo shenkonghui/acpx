@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+/** Compact ad-hoc command runner, shown inside the composer's "+" panel. */
 export function CustomCommand({
   disabled,
   busy,
@@ -18,31 +19,27 @@ export function CustomCommand({
       return;
     }
     onRun(trimmed);
+    setValue("");
   };
 
   return (
     <form
-      className="custom-command"
+      className="composer-command"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
       }}
     >
-      <h2>Custom command</h2>
       <input
         type="text"
         value={value}
-        placeholder="e.g. codebuddy --acp"
+        placeholder="以临时 agent 运行命令，例如 codebuddy --acp"
         disabled={blocked}
         onChange={(event) => setValue(event.target.value)}
       />
-      <button type="submit" disabled={blocked || trimmed.length === 0}>
-        Run
+      <button type="submit" className="button-primary" disabled={blocked || trimmed.length === 0}>
+        运行
       </button>
-      <p className="muted small">
-        Runs any command that resolves on PATH as a temporary agent (like <code>acpx --agent</code>
-        ).
-      </p>
     </form>
   );
 }

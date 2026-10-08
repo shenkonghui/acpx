@@ -1,10 +1,12 @@
 import type {
   ChatAction,
   ChatMessageRole,
+  ChatServerMessage,
   ChatState,
   ChatStatusView,
   TranscriptItem,
 } from "../types.js";
+import type { StoredSessions } from "./session-store.js";
 
 export function createInitialChatState(chatId: string): ChatState {
   return {
@@ -32,6 +34,9 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
         agent: action.agent,
         command: action.command,
         cwd: action.cwd ?? state.cwd,
+        model: action.model,
+        permissionMode: action.permissionMode,
+        models: undefined,
         transcript: [],
         status: { entries: [], availableCommands: [] },
         errors: [],
@@ -45,7 +50,24 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
         agent: action.agent,
         sessionKey: action.sessionKey,
         cwd: action.cwd,
+        ...(action.model !== undefined ? { model: action.model } : {}),
+        ...(action.models !== undefined ? { models: action.models } : {}),
+        ...(action.permissionMode !== undefined ? { permissionMode: action.permissionMode } : {}),
       };
+    case "session_models": {
+      const next = { ...state, models: action.models };
+      if (action.models.currentModelId !== undefined) {
+        next.model = action.models.currentModelId;
+      } else if (
+        state.model !== undefined &&
+        !action.models.availableModelIds.includes(state.model)
+      ) {
+        // The enabled-models filter removed the selected model; fall back to
+        // the first available option.
+        delete next.model;
+      }
+      return next;
+    }
     case "session_closed":
       return { ...state, opening: false };
     case "user_message":
@@ -97,7 +119,9 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
             : state.errors,
       };
     case "error":
-      return { ...state, errors: [...state.errors, action.message] };
+      // A failed `open_session` never emits `session_opened`, so clear the
+      // opening flag here or the chat would stay locked behind a dead session.
+      return { ...state, errors: [...state.errors, action.message], opening: false };
     case "clear_errors":
       return { ...state, errors: [] };
     default:
@@ -196,4 +220,133 @@ function finalizeTurn(transcript: TranscriptItem[], requestId: string): Transcri
       ? { ...item, streaming: false }
       : item,
   );
+}
+
+/** View state for the multi-session shell: many chats sharing one socket. */
+export type SessionsState = {
+  connected: boolean;
+  sessions: Record<string, ChatState>;
+  order: string[];
+  activeChatId?: string;
+};
+
+export type SessionsAction =
+  | { type: "disconnected" }
+  | {
+      type: "opening";
+      chatId: string;
+      agent?: string;
+      command?: string;
+      cwd?: string;
+      model?: string;
+    }
+  | { type: "user_message"; chatId: string; requestId: string; text: string }
+  | { type: "clear_errors"; chatId?: string }
+  | { type: "session_removed"; chatId: string }
+  | { type: "select_session"; chatId: string }
+  | ChatServerMessage;
+
+export function createInitialSessionsState(stored: StoredSessions): SessionsState {
+  const sessions: Record<string, ChatState> = {};
+  const order: string[] = [];
+  for (const item of stored.sessions) {
+    sessions[item.chatId] = {
+      ...createInitialChatState(item.chatId),
+      ...(item.agent !== undefined ? { agent: item.agent } : {}),
+      ...(item.command !== undefined ? { command: item.command } : {}),
+      ...(item.model !== undefined ? { model: item.model } : {}),
+      ...(item.cwd !== undefined ? { cwd: item.cwd } : {}),
+    };
+    order.push(item.chatId);
+  }
+  const activeChatId =
+    stored.activeChatId && sessions[stored.activeChatId] ? stored.activeChatId : order.at(-1);
+  return {
+    connected: false,
+    sessions,
+    order,
+    ...(activeChatId !== undefined ? { activeChatId } : {}),
+  };
+}
+
+/** Routes a frame to the session it names, or to the active session for global errors. */
+export function reduceSessionsState(state: SessionsState, action: SessionsAction): SessionsState {
+  switch (action.type) {
+    case "disconnected":
+      return { ...state, connected: false };
+    case "ready":
+      return { ...state, connected: true };
+    case "pong":
+      return state;
+    case "clear_errors": {
+      const chatId = action.chatId ?? state.activeChatId;
+      if (!chatId || !state.sessions[chatId]) {
+        return state;
+      }
+      return patchSession(
+        state,
+        chatId,
+        reduceChatState(state.sessions[chatId], { type: "clear_errors" }),
+      );
+    }
+    case "session_removed":
+      return removeSession(state, action.chatId);
+    case "select_session":
+      return state.sessions[action.chatId] ? { ...state, activeChatId: action.chatId } : state;
+    case "opening": {
+      const base = state.sessions[action.chatId] ?? createInitialChatState(action.chatId);
+      const next = reduceChatState(base, {
+        type: "opening",
+        ...(action.agent !== undefined ? { agent: action.agent } : {}),
+        ...(action.command !== undefined ? { command: action.command } : {}),
+        ...(action.cwd !== undefined ? { cwd: action.cwd } : {}),
+        ...(action.model !== undefined ? { model: action.model } : {}),
+      });
+      return patchSession(state, action.chatId, next);
+    }
+    case "user_message": {
+      const session = state.sessions[action.chatId];
+      if (!session) {
+        return state;
+      }
+      return patchSession(
+        state,
+        action.chatId,
+        reduceChatState(session, {
+          type: "user_message",
+          requestId: action.requestId,
+          text: action.text,
+        }),
+      );
+    }
+    default: {
+      const chatId = "chatId" in action ? action.chatId : undefined;
+      const target = chatId ?? state.activeChatId;
+      if (!target || !state.sessions[target]) {
+        return state;
+      }
+      return patchSession(state, target, reduceChatState(state.sessions[target], action));
+    }
+  }
+}
+
+function patchSession(state: SessionsState, chatId: string, next: ChatState): SessionsState {
+  const order = state.sessions[chatId] ? state.order : [...state.order, chatId];
+  return { ...state, sessions: { ...state.sessions, [chatId]: next }, order };
+}
+
+function removeSession(state: SessionsState, chatId: string): SessionsState {
+  if (!state.sessions[chatId]) {
+    return state;
+  }
+  const sessions = { ...state.sessions };
+  delete sessions[chatId];
+  const order = state.order.filter((id) => id !== chatId);
+  const activeChatId = state.activeChatId === chatId ? order.at(-1) : state.activeChatId;
+  return {
+    connected: state.connected,
+    sessions,
+    order,
+    ...(activeChatId !== undefined ? { activeChatId } : {}),
+  };
 }

@@ -28,8 +28,17 @@ import type { PermissionMode } from "../../../src/types.js";
 import { LiveAgentCatalog, type AgentCatalog, type AgentSummary } from "./agent-catalog.js";
 import { CHAT_PROTOCOL, chatClientMessageSchema, type ChatServerMessage } from "./chat-protocol.js";
 import { ChatSessionManager, type ChatRuntimeFactory } from "./chat-session.js";
+import { DiagnosticsRunner, type AgentSpecInput } from "./diagnostics.js";
 import { MutableAgentRegistry } from "./live-registry.js";
+import { ModelProbeRunner, type ModelProbeResult } from "./model-probe.js";
 import { formatChatOrigin, isAllowedChatRequest } from "./request-origin.js";
+import {
+  applySettingsMutation as applySettingsMutationToConfig,
+  buildSettingsView,
+  SettingsError,
+  type SettingsMutation,
+  type SettingsView,
+} from "./settings.js";
 
 export const CHAT_SERVER_ID = "acpx-acp-chat";
 
@@ -51,6 +60,8 @@ export type ChatServerOptions = {
   allowInstall?: boolean;
   /** Disable ad-hoc command sessions (default enabled). */
   allowCommand?: boolean;
+  /** Disable editing the agent config from the page (default enabled). */
+  allowSettings?: boolean;
   /** Test seam: fixed agent catalog instead of reading the user config per request. */
   agentCatalog?: AgentCatalog;
   /** Test seam: replace the live catalog source. */
@@ -66,6 +77,7 @@ export type ChatServerOptions = {
 export type ChatServerCapabilities = {
   install: boolean;
   command: boolean;
+  settings: boolean;
 };
 
 export type ChatServer = {
@@ -101,6 +113,7 @@ export async function createChatServer(options: ChatServerOptions = {}): Promise
   const stateDir = options.stateDir ?? defaultChatStateDir();
   const allowInstall = options.allowInstall !== false;
   const allowCommand = options.allowCommand !== false;
+  const allowSettings = options.allowSettings !== false;
 
   const registry = new MutableAgentRegistry();
   const fixedCatalog = options.agentCatalog;
@@ -129,6 +142,20 @@ export async function createChatServer(options: ChatServerOptions = {}): Promise
     },
     options.createRuntime,
   );
+
+  const diagnostics = new DiagnosticsRunner({
+    cwd,
+    stateDir,
+    registry,
+    verbose: options.verbose === true,
+  });
+
+  const modelProbe = new ModelProbeRunner({
+    cwd,
+    stateDir,
+    registry,
+    verbose: options.verbose === true,
+  });
 
   const vite = options.serveUi === false ? null : await createUiMiddleware(host, port);
   const chatSockets = createChatSocketServer(manager);
@@ -161,6 +188,18 @@ export async function createChatServer(options: ChatServerOptions = {}): Promise
       requestClose,
       allowInstall,
       allowCommand,
+      allowSettings,
+      diagnostics,
+      probeModels: (agent: string) => modelProbe.probe(agent),
+      getSettings: () =>
+        buildSettingsView({
+          cwd,
+          registry,
+          ...(options.gatewayConfigPath ? { gatewayConfigPath: options.gatewayConfigPath } : {}),
+        }),
+      applySettingsMutation: (mutation: SettingsMutation) =>
+        applySettingsMutationToConfig(mutation, { homeDir: os.homedir() }),
+      refreshSessionModels: (agent: string) => manager.refreshModelsForAgent(agent),
       loadRegistry: options.loadRegistry ?? (() => loadAcpRegistry()),
       installAgent: options.installAgent ?? installRegistryAgent,
     })
@@ -241,6 +280,13 @@ type ApiContext = {
   requestClose: () => Promise<void>;
   allowInstall: boolean;
   allowCommand: boolean;
+  allowSettings: boolean;
+  diagnostics: DiagnosticsRunner;
+  probeModels: (agent: string) => Promise<ModelProbeResult>;
+  getSettings: () => Promise<SettingsView>;
+  applySettingsMutation: (mutation: SettingsMutation) => Promise<{ name: string }>;
+  /** Re-reads the model list for live sessions on an agent (after enabledModels changed). */
+  refreshSessionModels: (agent: string) => Promise<void>;
   loadRegistry: () => Promise<AcpRegistry>;
   installAgent: (agent: RegistryAgent, options: InstallOptions) => Promise<InstallResult>;
 };
@@ -259,6 +305,25 @@ const installRequestSchema = z.object({
   asName: z.string().min(1).optional(),
   force: z.boolean().optional(),
 });
+
+const settingsUpsertSchema = z
+  .object({
+    name: z.string().min(1),
+    enabled: z.boolean().optional(),
+    argv: z.array(z.string()).min(1).optional(),
+    env: z.record(z.string(), z.string()).nullable().optional(),
+    enabledModels: z.array(z.string()).nullable().optional(),
+  })
+  .refine(
+    (value) =>
+      value.enabled !== undefined ||
+      value.argv !== undefined ||
+      value.env !== undefined ||
+      value.enabledModels !== undefined,
+    { message: "Provide at least one of enabled, argv, env, or enabledModels" },
+  );
+
+const settingsRemoveSchema = z.object({ name: z.string().min(1) });
 
 type ApiErrorBody = {
   code: string;
@@ -314,7 +379,10 @@ async function handleRegistryList(
     const registry = await context.loadRegistry();
     const platformKey = registryPlatformKey();
     const config = await loadResolvedConfig(context.cwd);
-    const configured = new Set(Object.keys(config.agents).map((name) => normalizeAgentName(name)));
+    const configured = new Set([
+      ...Object.keys(config.agents).map((name) => normalizeAgentName(name)),
+      ...config.disabledAgents,
+    ]);
     const agents = registry.agents.map((agent) => ({
       id: agent.id,
       name: agent.name,
@@ -395,6 +463,225 @@ async function handleRegistryInstall(
   }
 }
 
+function settingsErrorResponse(error: unknown): { status: number; body: ApiErrorBody } {
+  if (error instanceof SettingsError) {
+    return { status: 400, body: { code: error.code, message: error.message } };
+  }
+  return { status: 500, body: { code: "settings_write_failed", message: errorMessage(error) } };
+}
+
+async function handleSettingsList(
+  response: http.ServerResponse,
+  context: ApiContext,
+): Promise<void> {
+  try {
+    const view = await context.getSettings();
+    writeJson(response, 200, { ...view, writable: context.allowSettings });
+  } catch (error) {
+    writeJson(response, 500, { error: settingsErrorResponse(error).body });
+  }
+}
+
+function writeInvalidSettingsBody(response: http.ServerResponse, error: z.ZodError): void {
+  writeJson(response, 400, {
+    error: {
+      code: "invalid_body",
+      message: error.issues[0]?.message ?? "Invalid settings request",
+    } satisfies ApiErrorBody,
+  });
+}
+
+async function handleSettingsMutation(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  context: ApiContext,
+  action: "upsert" | "remove",
+): Promise<void> {
+  if (!context.allowSettings) {
+    writeJson(response, 403, {
+      error: {
+        code: "settings_disabled",
+        message: "Config editing is disabled (--no-settings)",
+      } satisfies ApiErrorBody,
+    });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(request);
+  } catch (error) {
+    writeJson(response, 400, {
+      error: { code: "invalid_body", message: errorMessage(error) } satisfies ApiErrorBody,
+    });
+    return;
+  }
+
+  let mutation: SettingsMutation;
+  if (action === "remove") {
+    const parsed = settingsRemoveSchema.safeParse(body);
+    if (!parsed.success) {
+      writeInvalidSettingsBody(response, parsed.error);
+      return;
+    }
+    mutation = { action: "remove", name: parsed.data.name };
+  } else {
+    const parsed = settingsUpsertSchema.safeParse(body);
+    if (!parsed.success) {
+      writeInvalidSettingsBody(response, parsed.error);
+      return;
+    }
+    const { name, enabled, argv, env, enabledModels } = parsed.data;
+    mutation = {
+      action: "upsert",
+      name,
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(argv !== undefined ? { argv } : {}),
+      ...(env !== undefined ? { env } : {}),
+      ...(enabledModels !== undefined ? { enabledModels } : {}),
+    };
+  }
+
+  try {
+    const result = await context.applySettingsMutation(mutation);
+    // Refresh the live registry so /api/agents reflects the change immediately.
+    await context.getCatalog();
+    // Push the new model allowlist to any live session on this agent.
+    if (mutation.action === "upsert" && mutation.enabledModels !== undefined) {
+      await context.refreshSessionModels(result.name);
+    }
+    writeJson(response, 200, { ok: true, name: result.name });
+  } catch (error) {
+    const { status, body: errorBody } = settingsErrorResponse(error);
+    writeJson(response, status, { error: errorBody });
+  }
+}
+
+type FsDirEntry = { name: string; path: string };
+
+const diagnosticsRequestSchema = z.object({
+  agents: z
+    .array(
+      z.object({
+        name: z.string().min(1),
+        argv: z.array(z.string()).optional(),
+      }),
+    )
+    .optional(),
+});
+
+/** Starts a diagnostics run over the catalog's installed agents (or an explicit list). */
+async function handleDiagnosticsStart(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  context: ApiContext,
+): Promise<void> {
+  let body: unknown = {};
+  try {
+    const raw = await readJsonBody(request);
+    body = raw ?? {};
+  } catch (error) {
+    // An absent body means "use the defaults"; only reject real parse failures.
+    const message = errorMessage(error);
+    if (!/unexpected end|json request body is required/i.test(message)) {
+      writeJson(response, 400, {
+        error: { code: "invalid_body", message } satisfies ApiErrorBody,
+      });
+      return;
+    }
+    body = {};
+  }
+  const parsed = diagnosticsRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    writeJson(response, 400, {
+      error: {
+        code: "invalid_body",
+        message: parsed.error.issues[0]?.message ?? "Invalid body",
+      } satisfies ApiErrorBody,
+    });
+    return;
+  }
+
+  let specs: AgentSpecInput[];
+  if (parsed.data.agents !== undefined) {
+    specs = parsed.data.agents.map((agent) => toAgentSpec(agent.name, agent.argv));
+  } else {
+    const catalog = await context.getCatalog();
+    specs = catalog.agents
+      .filter((agent) => agent.availability === "installed")
+      .map((agent) => toAgentSpec(agent.id, agent.launch?.argv));
+  }
+
+  if (context.diagnostics.running) {
+    writeJson(response, 409, {
+      error: {
+        code: "diagnostics_running",
+        message: "A diagnostics run is already in progress",
+      } satisfies ApiErrorBody,
+    });
+    return;
+  }
+  writeJson(response, 200, { ok: true, run: context.diagnostics.start(specs) });
+}
+
+const FS_DIR_LIMIT = 500;
+
+/** Builds one diagnostics agent spec, omitting `argv` when it is unknown. */
+function toAgentSpec(name: string, argv: string[] | undefined): AgentSpecInput {
+  return argv ? { name, argv } : { name };
+}
+
+/** Spawns the agent once and returns its advertised model list (for the settings editor). */
+async function handleModelProbe(
+  response: http.ServerResponse,
+  url: URL,
+  context: ApiContext,
+): Promise<void> {
+  const agent = url.searchParams.get("agent")?.trim() ?? "";
+  if (agent.length === 0) {
+    writeJson(response, 400, {
+      error: { code: "invalid_body", message: "An agent query parameter is required" },
+    });
+    return;
+  }
+  try {
+    const result = await context.probeModels(agent);
+    writeJson(response, 200, { ok: true, ...result });
+  } catch (error) {
+    writeJson(response, 502, {
+      ok: false,
+      error: { code: "model_probe_failed", message: errorMessage(error) },
+    });
+  }
+}
+
+/** Lists the subdirectories of one absolute path for the page's directory picker. */
+async function handleFsDirs(response: http.ServerResponse, url: URL): Promise<void> {
+  const requested = url.searchParams.get("path")?.trim() || os.homedir();
+  const target = path.resolve(requested);
+  try {
+    const stat = await fs.promises.stat(target);
+    if (!stat.isDirectory()) {
+      writeJson(response, 400, { code: "fs_error", message: `Not a directory: ${target}` });
+      return;
+    }
+    const dirents = await fs.promises.readdir(target, { withFileTypes: true });
+    const entries: FsDirEntry[] = dirents
+      .filter((dirent) => dirent.isDirectory())
+      .map((dirent) => ({ name: dirent.name, path: path.join(target, dirent.name) }))
+      .toSorted((left, right) => left.name.localeCompare(right.name))
+      .slice(0, FS_DIR_LIMIT);
+    const parent = path.dirname(target);
+    writeJson(response, 200, {
+      path: target,
+      parent: parent === target ? null : parent,
+      entries,
+    });
+  } catch (error) {
+    writeJson(response, 400, { code: "fs_error", message: errorMessage(error) });
+  }
+}
+
 export async function handleApiRequest(
   request: http.IncomingMessage,
   response: http.ServerResponse,
@@ -408,8 +695,30 @@ export async function handleApiRequest(
       cwd: context.cwd,
       permissionMode: context.permissionMode,
       stateDir: context.stateDir,
-      capabilities: { install: context.allowInstall, command: context.allowCommand },
+      capabilities: {
+        install: context.allowInstall,
+        command: context.allowCommand,
+        settings: context.allowSettings,
+      },
     } satisfies ChatServerHealth);
+    return true;
+  }
+
+  if (url.pathname === "/api/fs/dirs" && request.method === "GET") {
+    await handleFsDirs(response, url);
+    return true;
+  }
+
+  if (url.pathname === "/api/diagnostics" && request.method === "GET") {
+    writeJson(response, 200, {
+      running: context.diagnostics.running,
+      run: context.diagnostics.snapshot() ?? null,
+    });
+    return true;
+  }
+
+  if (url.pathname === "/api/diagnostics" && request.method === "POST") {
+    await handleDiagnosticsStart(request, response, context);
     return true;
   }
 
@@ -426,6 +735,26 @@ export async function handleApiRequest(
 
   if (url.pathname === "/api/registry/install" && request.method === "POST") {
     await handleRegistryInstall(request, response, context);
+    return true;
+  }
+
+  if (url.pathname === "/api/settings" && request.method === "GET") {
+    await handleSettingsList(response, context);
+    return true;
+  }
+
+  if (url.pathname === "/api/settings/agents" && request.method === "POST") {
+    await handleSettingsMutation(request, response, context, "upsert");
+    return true;
+  }
+
+  if (url.pathname === "/api/settings/agents/remove" && request.method === "POST") {
+    await handleSettingsMutation(request, response, context, "remove");
+    return true;
+  }
+
+  if (url.pathname === "/api/settings/models" && request.method === "GET") {
+    await handleModelProbe(response, url, context);
     return true;
   }
 
@@ -578,11 +907,14 @@ async function handleSocketMessage(
               chatId: message.chatId,
               command: message.command,
               ...(message.cwd ? { cwd: message.cwd } : {}),
+              ...(message.permissionMode ? { permissionMode: message.permissionMode } : {}),
             })
           : await manager.openSession({
               chatId: message.chatId,
               agent: message.agent ?? "",
               ...(message.cwd ? { cwd: message.cwd } : {}),
+              ...(message.model ? { model: message.model } : {}),
+              ...(message.permissionMode ? { permissionMode: message.permissionMode } : {}),
             });
       if (opened) {
         send(socket, {
@@ -591,10 +923,16 @@ async function handleSocketMessage(
           sessionKey: opened.sessionKey,
           agent: opened.agent,
           cwd: opened.cwd,
+          ...(opened.model !== undefined ? { model: opened.model } : {}),
+          ...(opened.models !== undefined ? { models: opened.models } : {}),
+          ...(opened.permissionMode ? { permissionMode: opened.permissionMode } : {}),
         });
       }
       return;
     }
+    case "set_model":
+      await manager.setModel(message.chatId, message.model);
+      return;
     case "send":
       await manager.send({
         chatId: message.chatId,
