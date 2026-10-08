@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveAgentCommandParts, splitCommandLine } from "../src/acp/client-process.js";
-import { initGlobalConfigFile, loadResolvedConfig, toConfigDisplay } from "../src/cli/config.js";
+import {
+  initGlobalConfigFile,
+  isAgentDisabled,
+  loadResolvedConfig,
+  toConfigDisplay,
+} from "../src/cli/config.js";
 
 test("config preserves prototype property names through loading and display", async () => {
   await withTempEnv(async ({ homeDir }) => {
@@ -164,6 +169,7 @@ test("project scalar values skip invalid shadowed global values", async () => {
       ...project,
       timeout: null,
       agents: {},
+      disabledAgents: [],
       authMethods: [],
     });
   });
@@ -588,7 +594,7 @@ test("loadResolvedConfig parses agent env and surfaces it in display", async () 
 
     const config = await loadResolvedConfig(cwd);
     assert.deepEqual(config.agents.custom, {
-      command: './bin/my-agent "acp"',
+      command: "./bin/my-agent acp",
       argv: ["./bin/my-agent", "acp"],
       env: { MY_AGENT_MODE: "acp", FEATURE: "1" },
     });
@@ -629,6 +635,82 @@ test("loadResolvedConfig rejects invalid agent env entries", async () => {
       );
       await assert.rejects(() => loadResolvedConfig(cwd), pattern);
     }
+  });
+});
+
+test("loadResolvedConfig separates agents disabled with enabled: false", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({
+        agents: {
+          codex: { enabled: false },
+          qoder: { argv: ["qodercli", "--acp"], enabled: true },
+          myagent: { command: "my-agent", enabled: false },
+        },
+      })}\n`,
+    );
+
+    const config = await loadResolvedConfig(cwd);
+    // Disabled entries never surface as launchable agents.
+    assert.deepEqual(config.agents, {
+      qoder: { command: "qodercli --acp", argv: ["qodercli", "--acp"] },
+    });
+    assert.deepEqual(config.disabledAgents.toSorted(), ["codex", "myagent"]);
+    assert.equal(isAgentDisabled(config, "codex"), true);
+    assert.equal(isAgentDisabled(config, "CODEX"), true);
+    assert.equal(isAgentDisabled(config, "qoder"), false);
+    assert.deepEqual(toConfigDisplay(config).disabledAgents, config.disabledAgents);
+  });
+});
+
+test("project config enabled flag overrides the global flag", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({
+        agents: {
+          qoder: { argv: ["global-qoder"], enabled: false },
+          codex: { argv: ["global-codex"] },
+        },
+      })}\n`,
+    );
+    await fs.writeFile(
+      path.join(cwd, ".acpxrc.json"),
+      `${JSON.stringify({
+        agents: {
+          qoder: { argv: ["project-qoder"], enabled: true },
+          codex: { enabled: false },
+        },
+      })}\n`,
+    );
+
+    const config = await loadResolvedConfig(cwd);
+    assert.deepEqual(config.agents, {
+      qoder: { command: "project-qoder", argv: ["project-qoder"] },
+    });
+    assert.deepEqual(config.disabledAgents, ["codex"]);
+    assert.equal(isAgentDisabled(config, "codex"), true);
+    assert.equal(isAgentDisabled(config, "qoder"), false);
+  });
+});
+
+test("loadResolvedConfig rejects a non-boolean enabled flag", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({ agents: { codex: { enabled: "yes" } } })}\n`,
+    );
+    await assert.rejects(loadResolvedConfig(cwd), /agents\.codex\.enabled.*expected boolean/u);
   });
 });
 

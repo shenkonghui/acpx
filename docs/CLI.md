@@ -25,7 +25,7 @@ acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
 acpx [global_options] compare <agent>... '<prompt_text>'
 acpx [global_options] compare <agent>... --file <path>
-acpx [global_options] gateway <agent>... [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway [agents...] [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] gateway --config <path> [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] registry list [--format <fmt>]
 acpx [global_options] registry show <agent-id> [--format <fmt>]
@@ -327,10 +327,13 @@ listed agent at startup, routes each `session/new` to the agent named in
 notifications upstream with gateway session ids:
 
 ```bash
-acpx [global_options] gateway <agent>... [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway [agents...] [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] gateway --config <path> [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
 ```
 
+- With no agents and no `--config`, the gateway serves every enabled agent from
+  the main config, in config order; config agents whose launch runs an
+  `acpx gateway` process are excluded to avoid recursion.
 - `--config <path>` loads the agent list from a JSON file (mutually exclusive
   with positional agents); entries carry a friendly `name` used for
   `_meta.acpx.agent` selection. See [Gateway](gateway.md) for the file format.

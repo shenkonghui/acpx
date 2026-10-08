@@ -128,7 +128,7 @@ function parseAvailableModels(value: unknown): AvailableModel[] | undefined {
     : undefined;
 }
 
-function isModelSelectOption(option: Record<string, unknown>): boolean {
+export function isModelSelectOption(option: Record<string, unknown>): boolean {
   return option.type === "select" && (option.category === "model" || option.id === "model");
 }
 

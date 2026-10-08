@@ -61,6 +61,18 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       pendingPrompts.set(message.id, message.params.sessionId);
       return;
     }
+    if (text.trim() === 'env') {
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: message.params.sessionId,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: \`\${label}:env \${process.env.GATEWAY_TEST_TOKEN ?? 'unset'}\` } },
+        },
+      });
+      send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+      return;
+    }
     send({
       jsonrpc: '2.0',
       method: 'session/update',
@@ -444,6 +456,129 @@ test("gateway: upstream stdin EOF retires all agents and exits cleanly", async (
         true,
         "beta agent must exit",
       );
+    } finally {
+      if (harness.child.exitCode === null) {
+        harness.child.kill("SIGKILL");
+      }
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("gateway: no arguments serves every enabled config agent", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-gateway-cwd-"));
+    const alpha = await spawnAgentScript(homeDir, AGENT_ALPHA);
+    const beta = await spawnAgentScript(homeDir, AGENT_BETA);
+    const gw = await spawnAgentScript(homeDir, "gw");
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            [AGENT_ALPHA]: {
+              argv: [
+                process.execPath,
+                alpha.scriptPath,
+                "--label",
+                AGENT_ALPHA,
+                "--pid-file",
+                alpha.pidFile,
+              ],
+              env: { GATEWAY_TEST_TOKEN: "secret" },
+            },
+            [AGENT_BETA]: { argv: [process.execPath, beta.scriptPath, "--label", AGENT_BETA] },
+            gw: {
+              // The trailing "gateway" token marks this entry as a gateway
+              // launch; the auto-selection must exclude it.
+              argv: [
+                process.execPath,
+                gw.scriptPath,
+                "--label",
+                "gw",
+                "--pid-file",
+                gw.pidFile,
+                "gateway",
+              ],
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const harness = spawnGateway(homeDir, cwd, []);
+    try {
+      await initializeGateway(harness);
+
+      const defaultSession = await harness.connection.newSession({ cwd, mcpServers: [] });
+      await harness.connection.prompt({
+        sessionId: defaultSession.sessionId,
+        prompt: [{ type: "text", text: "hello" }],
+      });
+      assert.ok(
+        harness.client.updateTexts().some((text) => text.includes(`${AGENT_ALPHA}:ok hello`)),
+        `expected default agent alpha output, got: ${harness.client.updateTexts().join(" | ")}`,
+      );
+
+      const betaSession = await harness.connection.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: newSessionMeta(AGENT_BETA),
+      });
+      await harness.connection.prompt({
+        sessionId: betaSession.sessionId,
+        prompt: [{ type: "text", text: "hello" }],
+      });
+      assert.ok(
+        harness.client.updateTexts().some((text) => text.includes(`${AGENT_BETA}:ok hello`)),
+        `expected beta agent output, got: ${harness.client.updateTexts().join(" | ")}`,
+      );
+
+      const envSession = await harness.connection.newSession({ cwd, mcpServers: [] });
+      await harness.connection.prompt({
+        sessionId: envSession.sessionId,
+        prompt: [{ type: "text", text: "env" }],
+      });
+      assert.ok(
+        harness.client.updateTexts().some((text) => text.includes(`${AGENT_ALPHA}:env secret`)),
+        `expected config env to reach the agent, got: ${harness.client.updateTexts().join(" | ")}`,
+      );
+
+      assert.equal(
+        await fs
+          .stat(gw.pidFile)
+          .then(() => false)
+          .catch(() => true),
+        true,
+        "the excluded gateway entry must not be spawned",
+      );
+    } finally {
+      harness.child.kill("SIGTERM");
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("gateway: no arguments with no servable config agents fails", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-gateway-cwd-"));
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({ agents: {} }, null, 2)}\n`,
+      "utf8",
+    );
+    const harness = spawnGateway(homeDir, cwd, []);
+    const exited = new Promise<number | null>((resolve) => {
+      harness.child.once("exit", (code) => resolve(code));
+    });
+    try {
+      const code = await exited;
+      assert.notEqual(code, 0);
+      assert.match(harness.stderrText, /No agents to serve/u);
     } finally {
       if (harness.child.exitCode === null) {
         harness.child.kill("SIGKILL");

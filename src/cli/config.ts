@@ -3,7 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { renderArgvIdentity } from "../acp/client-process.js";
-import { DEFAULT_AGENT_NAME, normalizeAgentName } from "../agent-registry.js";
+import {
+  DEFAULT_AGENT_NAME,
+  normalizeAgentName,
+  resolveCanonicalAgentName,
+} from "../agent-registry.js";
 import { parseMcpServers } from "../mcp-servers.js";
 import type {
   AuthPolicy,
@@ -18,6 +22,12 @@ export type ResolvedAgentConfig = {
   command: string;
   argv?: string[];
   env?: Record<string, string>;
+};
+
+/** A single `agents.<name>` entry: launch details and/or an explicit enabled flag. */
+type ParsedAgentEntry = {
+  launch?: ResolvedAgentConfig;
+  enabled?: boolean;
 };
 
 type ConfigAgentEntry =
@@ -49,6 +59,8 @@ export type ResolvedAcpxConfig = {
   queueMaxDepth: number;
   format: OutputFormat;
   agents: Record<string, ResolvedAgentConfig>;
+  /** Normalized names explicitly disabled with `enabled: false` in the config. */
+  disabledAgents: string[];
   auth: Record<string, string>;
   disableExec: boolean;
   mcpServers: McpServer[];
@@ -209,7 +221,7 @@ function parseDefaultAgent(value: unknown, sourcePath: string): string | undefin
 function parseAgents(
   value: unknown,
   sourcePath: string,
-): Record<string, ResolvedAgentConfig> | undefined {
+): Record<string, ParsedAgentEntry> | undefined {
   if (value == null) {
     return undefined;
   }
@@ -225,15 +237,49 @@ function parseAgents(
   );
 }
 
-function parseAgentEntry(raw: unknown, name: string, sourcePath: string): ResolvedAgentConfig {
+function parseAgentEntry(raw: unknown, name: string, sourcePath: string): ParsedAgentEntry {
   if (!isObject(raw)) {
     throw new Error(`Invalid config agents.${name} in ${sourcePath}: expected object with command`);
+  }
+  const enabled = parseAgentEnabled(raw.enabled, name, sourcePath);
+  if (!hasLaunchFields(raw)) {
+    if (enabled === undefined) {
+      throw new Error(`Invalid config agents.${name} in ${sourcePath}: expected command or argv`);
+    }
+    return { enabled };
   }
   const env = parseAgentEnv(raw.env, name, sourcePath);
   const entry = Object.prototype.hasOwnProperty.call(raw, "argv")
     ? parseArgvAgentEntry(raw, name, sourcePath)
     : parseLegacyAgentEntry(raw, name, sourcePath);
-  return env ? { ...entry, env } : entry;
+  return {
+    launch: env ? { ...entry, env } : entry,
+    ...(enabled !== undefined ? { enabled } : {}),
+  };
+}
+
+function hasLaunchFields(raw: Record<string, unknown>): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(raw, "argv") ||
+    Object.prototype.hasOwnProperty.call(raw, "command") ||
+    Object.prototype.hasOwnProperty.call(raw, "args")
+  );
+}
+
+function parseAgentEnabled(
+  value: unknown,
+  agentName: string,
+  sourcePath: string,
+): boolean | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(
+      `Invalid config agents.${agentName}.enabled in ${sourcePath}: expected boolean`,
+    );
+  }
+  return value;
 }
 
 function parseAgentEnv(
@@ -478,10 +524,10 @@ export async function loadResolvedConfig(
     format: resolveScalar("format", parseOutputFormat, DEFAULT_OUTPUT_FORMAT),
   };
 
-  const agents = {
-    ...parseAgents(globalConfig?.agents, globalPath),
-    ...parseAgents(projectConfig?.agents, projectPath),
-  };
+  const { agents, disabledAgents } = resolveAgentEntries(
+    parseAgents(globalConfig?.agents, globalPath),
+    parseAgents(projectConfig?.agents, projectPath),
+  );
   const auth = {
     ...parseAuth(globalConfig?.auth, globalPath),
     ...parseAuth(projectConfig?.auth, projectPath),
@@ -500,6 +546,7 @@ export async function loadResolvedConfig(
   return {
     ...scalar,
     agents,
+    disabledAgents,
     auth,
     disableExec,
     mcpServers,
@@ -512,6 +559,78 @@ export async function loadResolvedConfig(
     hasGlobalConfig: globalResult.exists,
     hasProjectConfig: projectResult.exists,
   };
+}
+
+function resolveAgentEntries(
+  globalAgents: Record<string, ParsedAgentEntry> | undefined,
+  projectAgents: Record<string, ParsedAgentEntry> | undefined,
+): { agents: Record<string, ResolvedAgentConfig>; disabledAgents: string[] } {
+  const agents: Record<string, ResolvedAgentConfig> = {};
+  const disabledAgents: string[] = [];
+  for (const name of mergedAgentNames(globalAgents, projectAgents)) {
+    const project = projectAgents?.[name];
+    const global = globalAgents?.[name];
+    if (!resolveEnabled(project, global)) {
+      disabledAgents.push(name);
+      continue;
+    }
+    const launch = resolveLaunch(project, global);
+    if (launch) {
+      defineAgent(agents, name, launch);
+    }
+  }
+  return { agents, disabledAgents };
+}
+
+function mergedAgentNames(
+  globalAgents: Record<string, ParsedAgentEntry> | undefined,
+  projectAgents: Record<string, ParsedAgentEntry> | undefined,
+): string[] {
+  return [...new Set([...Object.keys(globalAgents ?? {}), ...Object.keys(projectAgents ?? {})])];
+}
+
+function resolveEnabled(
+  project: ParsedAgentEntry | undefined,
+  global: ParsedAgentEntry | undefined,
+): boolean {
+  return project?.enabled ?? global?.enabled ?? true;
+}
+
+function resolveLaunch(
+  project: ParsedAgentEntry | undefined,
+  global: ParsedAgentEntry | undefined,
+): ResolvedAgentConfig | undefined {
+  return project?.launch ?? global?.launch;
+}
+
+/** Defines an own property so a literal `__proto__` agent name is preserved. */
+function defineAgent(
+  agents: Record<string, ResolvedAgentConfig>,
+  name: string,
+  launch: ResolvedAgentConfig,
+): void {
+  Object.defineProperty(agents, name, {
+    value: launch,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/**
+ * True when `name` is explicitly disabled (`enabled: false`) in the resolved config.
+ * Matches both the normalized and canonical name so built-in aliases are covered.
+ */
+export function isAgentDisabled(config: ResolvedAcpxConfig, name: string): boolean {
+  const normalized = normalizeAgentName(name);
+  if (!normalized) {
+    return false;
+  }
+  if (config.disabledAgents.includes(normalized)) {
+    return true;
+  }
+  const canonical = resolveCanonicalAgentName(name);
+  return canonical !== normalized && config.disabledAgents.includes(canonical);
 }
 
 function hasConfigKey(config: ConfigFileShape | undefined, key: keyof ConfigFileShape): boolean {
@@ -563,6 +682,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
   queueMaxDepth: number;
   format: OutputFormat;
   agents: Record<string, ConfigAgentEntry>;
+  disabledAgents: string[];
   authMethods: string[];
   disableExec: boolean;
 } {
@@ -585,6 +705,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
     queueMaxDepth: config.queueMaxDepth,
     format: config.format,
     agents,
+    disabledAgents: [...config.disabledAgents],
     authMethods: Object.keys(config.auth).toSorted(),
     disableExec: config.disableExec,
   };

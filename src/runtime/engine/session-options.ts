@@ -8,6 +8,12 @@ export type SessionAgentOptions = {
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
   /**
+   * Backend agent name for ACP servers that multiplex agents (the acpx
+   * gateway). Sent as session/new `_meta: { acpx: { agent } }`; ignored by
+   * plain agents.
+   */
+  gatewayAgent?: string;
+  /**
    * Per-agent environment variables injected into the spawned agent child
    * process and persisted with the session record for reconnects. Keys here
    * override the parent process environment for the spawned child, except
@@ -24,10 +30,12 @@ export function mergeSessionOptions(
   fallback: SessionAgentOptions | undefined,
 ): SessionAgentOptions | undefined {
   const merged: SessionAgentOptions = { ...fallback };
-  assignDefinedOption(merged, "model", preferred?.model);
-  assignDefinedOption(merged, "allowedTools", preferred?.allowedTools);
-  assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
-  assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
+  const { model, allowedTools, maxTurns, systemPrompt, gatewayAgent } = preferred ?? {};
+  assignDefinedOption(merged, "model", model);
+  assignDefinedOption(merged, "allowedTools", allowedTools);
+  assignDefinedOption(merged, "maxTurns", maxTurns);
+  assignDefinedOption(merged, "systemPrompt", systemPrompt);
+  assignDefinedOption(merged, "gatewayAgent", gatewayAgent);
   assignDefinedOption(merged, "env", mergeEnvRecords(fallback?.env, preferred?.env));
   return Object.keys(merged).length > 0 ? merged : undefined;
 }

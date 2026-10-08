@@ -20,7 +20,7 @@ import {
   type OutputPolicy,
   type PermissionMode,
 } from "../types.js";
-import type { ResolvedAcpxConfig } from "./config.js";
+import { isAgentDisabled, type ResolvedAcpxConfig, type ResolvedAgentConfig } from "./config.js";
 import { toTimerMilliseconds } from "./timer-duration.js";
 
 export type PermissionFlags = {
@@ -639,13 +639,12 @@ function resolveInvocationCommand(
   if (override !== undefined) {
     return { agentCommand: override };
   }
-  const normalizedAgentName = normalizeAgentName(agentName);
-  const canonicalAgentName = resolveCanonicalAgentName(agentName);
-  const configuredAgent = Object.hasOwn(config.agents, normalizedAgentName)
-    ? config.agents[normalizedAgentName]
-    : Object.hasOwn(config.agents, canonicalAgentName)
-      ? config.agents[canonicalAgentName]
-      : undefined;
+  if (isAgentDisabled(config, agentName)) {
+    throw new InvalidArgumentError(
+      `Agent "${agentName}" is disabled (enabled: false) in ${config.globalPath}`,
+    );
+  }
+  const configuredAgent = findConfiguredAgent(config, agentName);
   if (configuredAgent) {
     return {
       agentCommand: configuredAgent.command,
@@ -658,4 +657,18 @@ function resolveInvocationCommand(
     agentCommand: resolveAgentCommandFromRegistry(agentName),
     ...(agentArgv ? { agentArgv } : {}),
   };
+}
+
+function findConfiguredAgent(
+  config: ResolvedAcpxConfig,
+  agentName: string,
+): ResolvedAgentConfig | undefined {
+  const normalizedAgentName = normalizeAgentName(agentName);
+  if (Object.hasOwn(config.agents, normalizedAgentName)) {
+    return config.agents[normalizedAgentName];
+  }
+  const canonicalAgentName = resolveCanonicalAgentName(agentName);
+  return Object.hasOwn(config.agents, canonicalAgentName)
+    ? config.agents[canonicalAgentName]
+    : undefined;
 }

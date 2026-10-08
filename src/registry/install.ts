@@ -8,6 +8,17 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { AGENT_REGISTRY, normalizeAgentName } from "../agent-registry.js";
+import {
+  isSafeAgentName,
+  readAgentLaunchEntry,
+  readRawConfigFile,
+  removeAgentEntry,
+  resolveGlobalConfigPath,
+  upsertAgentEntry,
+  writeRawConfigFile,
+  type AgentLaunchEntry,
+  type RawConfigFile,
+} from "../config-file.js";
 import { AcpxOperationalError } from "../errors.js";
 import { resolveInstalledExecutable } from "../spawn-command-options.js";
 import {
@@ -20,8 +31,6 @@ import {
 } from "./types.js";
 
 export const DEFAULT_ARCHIVE_DOWNLOAD_TIMEOUT_MS = 600_000;
-
-const SAFE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/u;
 
 export type InstallOptions = {
   asName?: string;
@@ -55,10 +64,8 @@ export type UninstallResult = {
   removedInstallDir?: string;
 };
 
-type RawConfigFile = Record<string, unknown>;
-
 export function defaultRegistryConfigPath(homeDir: string = os.homedir()): string {
-  return path.join(homeDir, ".acpx", "config.json");
+  return resolveGlobalConfigPath(homeDir);
 }
 
 export function defaultRegistryAgentsRoot(homeDir: string = os.homedir()): string {
@@ -216,7 +223,7 @@ async function removeConfigAgentEntry(
   config: RawConfigFile | undefined,
   name: string,
 ): Promise<boolean> {
-  if (config === undefined || !deleteConfigAgentEntry(config, name)) {
+  if (config === undefined || !removeAgentEntry(config, name)) {
     return false;
   }
   await writeGlobalConfigFile(configPath, config);
@@ -256,7 +263,7 @@ export async function uninstallRegistryAgent(
   const agentsRoot = defaultRegistryAgentsRoot(homeDir);
   const config = await readGlobalConfigFile(configPath);
   const installDir = resolveInstalledAgentDir(
-    readConfigAgentEntry(config, registeredName),
+    readAgentLaunchEntry(config, registeredName),
     agentsRoot,
     registeredName,
   );
@@ -276,7 +283,7 @@ export async function uninstallRegistryAgent(
 
 function resolveRegisteredName(agent: RegistryAgent, asName: string | undefined): string {
   const name = normalizeAgentName(asName ?? agent.id);
-  if (!name || !SAFE_ID_PATTERN.test(name)) {
+  if (!name || !isSafeAgentName(name)) {
     throw new AcpxOperationalError(
       `Invalid agent name for registry install: ${JSON.stringify(asName ?? agent.id)}`,
       { origin: "cli", detailCode: "REGISTRY_INVALID_NAME" },
@@ -333,7 +340,7 @@ type BinaryInstallResult = {
 type ResolvedInstallOptions = InstallOptions & { homeDir: string };
 
 function assertSafeIdentity(agent: RegistryAgent): void {
-  if (!SAFE_ID_PATTERN.test(agent.id) || !SAFE_ID_PATTERN.test(agent.version)) {
+  if (!isSafeAgentName(agent.id) || !isSafeAgentName(agent.version)) {
     throw new AcpxOperationalError(
       `Registry agent has an unsafe id or version for installation: ${agent.id}@${agent.version}`,
       { origin: "cli", detailCode: "REGISTRY_UNSAFE_IDENTITY" },
@@ -663,57 +670,20 @@ async function removePathIfExists(target: string): Promise<void> {
 }
 
 async function readGlobalConfigFile(configPath: string): Promise<RawConfigFile | undefined> {
-  let payload: string;
   try {
-    payload = await fs.readFile(configPath, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return undefined;
-    }
-    throw error;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(payload);
+    return await readRawConfigFile(configPath);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new AcpxOperationalError(`Global config is not valid JSON (${configPath}): ${reason}`, {
+    throw new AcpxOperationalError(reason, {
       origin: "cli",
       detailCode: "REGISTRY_CONFIG_INVALID",
       cause: error,
     });
   }
-  if (!isObject(parsed)) {
-    throw new AcpxOperationalError(
-      `Global config has an unexpected shape (${configPath}): expected a JSON object`,
-      { origin: "cli", detailCode: "REGISTRY_CONFIG_INVALID" },
-    );
-  }
-  return parsed;
 }
 
 async function writeGlobalConfigFile(configPath: string, config: RawConfigFile): Promise<void> {
-  await fs.mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
-  await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-}
-
-function configAgentsObject(config: RawConfigFile): Record<string, unknown> {
-  const agents = config.agents;
-  if (agents == null) {
-    const created: Record<string, unknown> = {};
-    config.agents = created;
-    return created;
-  }
-  if (!isObject(agents)) {
-    throw new AcpxOperationalError(
-      "Global config agents must be an object mapping agent names to launch definitions",
-      { origin: "cli", detailCode: "REGISTRY_CONFIG_INVALID" },
-    );
-  }
-  return agents;
+  await writeRawConfigFile(configPath, config);
 }
 
 async function upsertConfigAgentEntry(
@@ -723,8 +693,7 @@ async function upsertConfigAgentEntry(
   env: RegistryEnv | undefined,
 ): Promise<void> {
   const config = (await readGlobalConfigFile(configPath)) ?? {};
-  const agents = configAgentsObject(config);
-  agents[name] = env ? { argv, env } : { argv };
+  upsertAgentEntry(config, name, env ? { argv, env } : { argv });
   await writeGlobalConfigFile(configPath, config);
 }
 
@@ -734,49 +703,7 @@ async function hasConfigAgentEntry(configPath: string, name: string): Promise<bo
   return isObject(agents) && Object.hasOwn(agents, name);
 }
 
-type ConfigLaunchEntry = { argv?: string[]; command?: string };
-
-function readStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  return value.filter((item): item is string => typeof item === "string");
-}
-
-function buildConfigLaunchEntry(entry: Record<string, unknown>): ConfigLaunchEntry | undefined {
-  const argv = readStringArray(entry.argv);
-  const command = typeof entry.command === "string" ? entry.command : undefined;
-  if (!argv && !command) {
-    return undefined;
-  }
-  return { ...(argv ? { argv } : {}), ...(command ? { command } : {}) };
-}
-
-function readConfigAgentEntry(
-  config: RawConfigFile | undefined,
-  name: string,
-): ConfigLaunchEntry | undefined {
-  const agents = config?.agents;
-  if (!isObject(agents)) {
-    return undefined;
-  }
-  const entry = agents[name];
-  if (!isObject(entry)) {
-    return undefined;
-  }
-  return buildConfigLaunchEntry(entry);
-}
-
-function deleteConfigAgentEntry(config: RawConfigFile, name: string): boolean {
-  const agents = configAgentsObject(config);
-  if (!Object.hasOwn(agents, name)) {
-    return false;
-  }
-  delete agents[name];
-  return true;
-}
-
-function firstLaunchCommand(entry: ConfigLaunchEntry | undefined): string | undefined {
+function firstLaunchCommand(entry: AgentLaunchEntry | undefined): string | undefined {
   if (!entry) {
     return undefined;
   }
@@ -784,7 +711,7 @@ function firstLaunchCommand(entry: ConfigLaunchEntry | undefined): string | unde
 }
 
 function resolveInstallDirFromLaunch(
-  entry: ConfigLaunchEntry | undefined,
+  entry: AgentLaunchEntry | undefined,
   agentsRoot: string,
 ): string | undefined {
   const launchCommand = firstLaunchCommand(entry);
@@ -801,7 +728,7 @@ function resolveInstallDirFromLaunch(
 }
 
 function resolveInstalledAgentDir(
-  entry: ConfigLaunchEntry | undefined,
+  entry: AgentLaunchEntry | undefined,
   agentsRoot: string,
   registeredName: string,
 ): string | undefined {

@@ -44,6 +44,7 @@ function config(overrides: Partial<ResolvedAcpxConfig> = {}): ResolvedAcpxConfig
     queueMaxDepth: 16,
     format: "text",
     agents: {},
+    disabledAgents: [],
     auth: {},
     disableExec: false,
     mcpServers: [],

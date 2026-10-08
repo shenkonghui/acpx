@@ -66,6 +66,7 @@ acpx [global_options] status [-s <name>]
 acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | watch [-s <name>] [--cursor <cursor>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
 acpx [global_options] registry list | show <agent-id> | install <agent-id> [--method binary|npx|uvx] [--as <name>] [--force] | uninstall <name>
+acpx [global_options] gateway [agents...] [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -79,6 +80,11 @@ acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--n
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
+
+`gateway` serves multiple agents as one ACP server over stdio; route sessions
+with `session/new` `_meta {acpx:{agent}}`. With no agents and no `--config`, it
+serves every enabled agent from the main config (config agents whose launch
+runs an `acpx gateway` process are excluded); the first is the default.
 
 ## Built-in agent registry
 

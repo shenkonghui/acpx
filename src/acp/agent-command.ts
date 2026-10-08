@@ -278,12 +278,24 @@ export function buildClaudeCodeOptionsMeta(
   }
 
   assignClaudeCodeSystemPrompt(meta, options?.systemPrompt);
+  assignGatewayAgentMeta(meta, options?.gatewayAgent);
 
   if (Object.keys(meta).length === 0) {
     return undefined;
   }
 
   return meta;
+}
+
+/** Routes session/new to one backend of a multiplexing server (the acpx gateway). */
+function assignGatewayAgentMeta(
+  meta: Record<string, unknown>,
+  gatewayAgent: string | undefined,
+): void {
+  const name = gatewayAgent?.trim();
+  if (name) {
+    meta.acpx = { agent: name };
+  }
 }
 
 export function resolveClaudeCodeSettingSources(env: NodeJS.ProcessEnv = process.env): string[] {

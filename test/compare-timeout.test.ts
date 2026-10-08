@@ -14,6 +14,7 @@ const config: ResolvedAcpxConfig = {
   queueMaxDepth: 16,
   format: "json",
   agents: { fast: { command: "fast" }, slow: { command: "slow" } },
+  disabledAgents: [],
   auth: {},
   disableExec: false,
   mcpServers: [],

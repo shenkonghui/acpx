@@ -309,6 +309,8 @@ export type AcpClientOptions = {
     maxTurns?: number;
     systemPrompt?: string | { append: string };
     env?: Record<string, string>;
+    /** Backend agent for multiplexing ACP servers (acpx gateway _meta routing). */
+    gatewayAgent?: string;
   };
   onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
   onAcpOutputMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;

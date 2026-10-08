@@ -33,6 +33,7 @@ import {
   type WriteTextFileRequest,
   type WriteTextFileResponse,
   type SessionConfigOption,
+  type SessionModeState,
 } from "@agentclientprotocol/sdk";
 import { FsSafeError } from "@openclaw/fs-safe/errors";
 import {
@@ -220,6 +221,7 @@ export type SessionCreateResult = {
   agentSessionId?: string;
   configOptions?: SessionConfigOption[];
   models?: SessionModelState;
+  modes?: SessionModeState;
   configOptionsPresent: boolean;
   legacyModelMetadataPresent: boolean;
 };
@@ -228,6 +230,7 @@ export type SessionLoadResult = {
   agentSessionId?: string;
   configOptions?: SessionConfigOption[];
   models?: SessionModelState;
+  modes?: SessionModeState;
   configOptionsPresent: boolean;
   legacyModelMetadataPresent: boolean;
 };
@@ -249,6 +252,12 @@ function normalizeResponseConfigOptions(
   return response.configOptions ?? [];
 }
 
+function normalizeResponseModes(
+  response: { modes?: SessionModeState | null } | undefined,
+): SessionModeState | undefined {
+  return response?.modes ?? undefined;
+}
+
 function toReconnectedSessionResult(
   response: ReconnectedSessionResponse | undefined,
 ): SessionLoadResult {
@@ -257,6 +266,7 @@ function toReconnectedSessionResult(
     agentSessionId: extractAgentSessionId(response?._meta),
     configOptions,
     models: modelStateFromSessionResponse({ configOptions, response }),
+    modes: normalizeResponseModes(response),
     configOptionsPresent: hasResponseField(response, "configOptions"),
     legacyModelMetadataPresent: hasResponseField(response, "models"),
   };
@@ -1122,6 +1132,7 @@ export class AcpClient {
       agentSessionId: extractAgentSessionId(result._meta),
       configOptions,
       models,
+      modes: normalizeResponseModes(result),
       configOptionsPresent: hasResponseField(result, "configOptions"),
       legacyModelMetadataPresent: hasResponseField(result, "models"),
     };

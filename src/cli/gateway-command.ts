@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { renderArgvIdentity } from "../acp/client-process.js";
+import { renderArgvIdentity, splitCommandLine } from "../acp/client-process.js";
 import type { GatewayAgentSpec } from "../acp/gateway.js";
 import {
   normalizeAgentName,
@@ -9,7 +9,7 @@ import {
   resolveAgentCommand as resolveAgentCommandFromRegistry,
   resolveCanonicalAgentName,
 } from "../agent-registry.js";
-import type { ResolvedAcpxConfig } from "./config.js";
+import { isAgentDisabled, type ResolvedAcpxConfig, type ResolvedAgentConfig } from "./config.js";
 import { parseNonEmptyValue, resolvePermissionMode } from "./flags.js";
 import type { PermissionFlags } from "./flags.js";
 
@@ -220,6 +220,11 @@ async function loadGatewayConfigFile(
 }
 
 function resolveGatewayAgent(name: string, config: ResolvedAcpxConfig): GatewayAgentSpec {
+  if (isAgentDisabled(config, name)) {
+    throw new InvalidArgumentError(
+      `Agent "${name}" is disabled (enabled: false) in ${config.globalPath}`,
+    );
+  }
   const normalizedAgentName = normalizeAgentName(name);
   const canonicalAgentName = resolveCanonicalAgentName(name);
   const configuredAgent = Object.hasOwn(config.agents, normalizedAgentName)
@@ -243,6 +248,52 @@ function resolveGatewayAgent(name: string, config: ResolvedAcpxConfig): GatewayA
   };
 }
 
+/** True when the agent's launch argv runs an `acpx gateway` process. */
+export function isGatewayProcessLaunch(agent: ResolvedAgentConfig): boolean {
+  const argv = agent.argv ?? splitCommandTokens(agent.command);
+  return argv.some((token) => token === "gateway");
+}
+
+function splitCommandTokens(command: string): string[] {
+  try {
+    const parsed = splitCommandLine(command);
+    return [parsed.command, ...parsed.args];
+  } catch {
+    return [command];
+  }
+}
+
+export type GatewayConfigSelection = {
+  agents: GatewayAgentSpec[];
+  defaultAgent: string;
+};
+
+/**
+ * Every enabled config agent except gateway launches; the first entry in config
+ * order is the default. Config agents whose launch runs an `acpx gateway`
+ * process are excluded so a config-driven gateway does not spawn itself.
+ */
+export function resolveGatewayAgentsFromConfig(config: ResolvedAcpxConfig): GatewayConfigSelection {
+  const specs: GatewayAgentSpec[] = [];
+  for (const [name, entry] of Object.entries(config.agents)) {
+    if (isGatewayProcessLaunch(entry)) {
+      continue;
+    }
+    specs.push({
+      name,
+      agentCommand: entry.command,
+      ...(entry.argv ? { agentArgv: [...entry.argv] } : {}),
+      ...(entry.env ? { env: { ...entry.env } } : {}),
+    });
+  }
+  if (specs.length === 0) {
+    throw new InvalidArgumentError(
+      `No agents to serve: define agents in ${config.globalPath} or ${config.projectPath}; agents whose launch runs an acpx gateway process are excluded to avoid recursion`,
+    );
+  }
+  return { agents: specs, defaultAgent: specs[0].name };
+}
+
 export function registerGatewayCommand(program: Command, config: ResolvedAcpxConfig): void {
   program
     .command("gateway")
@@ -251,7 +302,7 @@ export function registerGatewayCommand(program: Command, config: ResolvedAcpxCon
     )
     .argument(
       "[agents...]",
-      "Agent names or raw commands (the first agent is the default; or use --config)",
+      "Agent names or raw commands (the first agent is the default); omit to serve every enabled agent from the config",
     )
     .option("--config <path>", "Load gateway agents from a JSON config file", (value: string) =>
       parseNonEmptyValue("Gateway config", value),
@@ -272,12 +323,11 @@ export function registerGatewayCommand(program: Command, config: ResolvedAcpxCon
         const parsed = await loadGatewayConfigFile(flags.config);
         specs = parsed.agents;
         defaultAgent = parsed.defaultAgent;
+      } else if (agents.length === 0) {
+        const selection = resolveGatewayAgentsFromConfig(config);
+        specs = selection.agents;
+        defaultAgent = selection.defaultAgent;
       } else {
-        if (agents.length === 0) {
-          throw new InvalidArgumentError(
-            "At least one agent is required (positional agents or --config)",
-          );
-        }
         specs = agents.map((name) => resolveGatewayAgent(name, config));
       }
 

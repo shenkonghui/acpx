@@ -362,7 +362,7 @@ test("registry install --format json emits the install result", async () => {
     assert.equal(path.basename(payload.argv[0] ?? ""), "hello-agent");
     assert.deepEqual(payload.env, { REGISTRY_AGENT_MARKER: "from-registry" });
     assert.ok(payload.installDir);
-    assert.ok(await fs.stat(payload.installDir!));
+    assert.ok(await fs.stat(payload.installDir));
   });
 });
 
