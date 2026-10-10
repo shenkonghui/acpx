@@ -112,6 +112,7 @@ Rules:
 - Names such as `constructor` and `__proto__` work like any other custom name and remain visible in `config show`.
 - `argv` is the preferred form and is required for custom agent launches on Windows. Its first item is the executable and every remaining item is passed literally as one argument.
 - `env` is an optional map of string values merged into the child process environment when acpx spawns the agent. It is how [`acpx registry`](registry.md) records the environment some ACP servers require. Changing an agent's `env` takes effect on new sessions; restart a warm queue owner to pick it up.
+- `enabledModels` is an optional array of bare model ids (no `<agent>/` prefix) that whitelists the models an agent may advertise. Absent or empty means every advertised model is allowed. An entry with an unknown id simply never matches; it is not an error. Only the gateway honors `enabledModels` today — direct `acpx <agent>` calls still see every model the adapter advertises.
 - Legacy `{ "command": "…", "args": […] }` entries migrate when `command` is an unquoted executable with no whitespace. Quoted executables and inline arguments are rejected as ambiguous; move the complete launch to `argv`.
 - A legacy `command` without `args` remains a raw command string for Unix compatibility. Windows rejects it with migration guidance because inferring argv would corrupt paths and quoting.
 - The raw `--agent <command>` escape hatch is likewise Unix-only.

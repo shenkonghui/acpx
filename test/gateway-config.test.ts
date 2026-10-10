@@ -92,6 +92,28 @@ test("gateway config selection: no servable agents is an error", async () => {
   });
 });
 
+test("gateway config selection: enabledModels are threaded and gateway entries filter the merged surface", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeGlobalConfig(homeDir, {
+      agents: {
+        alpha: { argv: ["node", "alpha.mjs"], enabledModels: ["m-1", "m-2"] },
+        beta: { argv: ["node", "beta.mjs"] },
+        "acpx-gateway": {
+          argv: ["node", "cli.js", "gateway"],
+          enabledModels: ["alpha/m-1", "beta/m-9"],
+        },
+      },
+    });
+    const config = await loadResolvedConfig(cwd);
+    const selection = resolveGatewayAgentsFromConfig(config);
+    assert.deepEqual(selection.agents[0].enabledModels, ["m-1", "m-2"]);
+    assert.equal(selection.agents[1].enabledModels, undefined);
+    assert.deepEqual(selection.gatewayEnabledModels, ["alpha/m-1", "beta/m-9"]);
+  });
+});
+
 test("isGatewayProcessLaunch: detects gateway token across launch forms", () => {
   assert.equal(isGatewayProcessLaunch({ command: "x", argv: ["node", "cli.js", "gateway"] }), true);
   assert.equal(isGatewayProcessLaunch({ command: "node cli.js gateway" }), true);

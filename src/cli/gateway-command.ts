@@ -23,6 +23,7 @@ type GatewayFileAgentEntry = {
   name: string;
   agentCommand: string;
   agentArgv?: string[];
+  enabledModels?: string[];
   isDefault: boolean;
 };
 
@@ -132,12 +133,34 @@ function parseGatewayFileAgentEntry(
     );
   }
   const launch = resolveEntryLaunch(raw, label, sourcePath);
+  const enabledModels = parseEntryEnabledModels(raw.enabledModels, label, sourcePath);
   return {
     name,
     agentCommand: launch.agentCommand,
     ...(launch.agentArgv ? { agentArgv: launch.agentArgv } : {}),
+    ...(enabledModels ? { enabledModels } : {}),
     isDefault: parseEntryDefault(raw, label, sourcePath),
   };
+}
+
+function parseEntryEnabledModels(
+  value: unknown,
+  label: string,
+  sourcePath: string,
+): string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (
+    !isStringArray(value) ||
+    value.length === 0 ||
+    value.some((item) => item.trim().length === 0)
+  ) {
+    throw new InvalidArgumentError(
+      `Invalid gateway config ${label}.enabledModels in ${sourcePath}: expected non-empty array of non-empty strings`,
+    );
+  }
+  return [...new Set(value)];
 }
 
 export type ParsedGatewayConfig = {
@@ -172,6 +195,7 @@ function toAgentSpecs(entries: GatewayFileAgentEntry[]): GatewayAgentSpec[] {
     name: entry.name,
     agentCommand: entry.agentCommand,
     ...(entry.agentArgv ? { agentArgv: entry.agentArgv } : {}),
+    ...(entry.enabledModels ? { enabledModels: entry.enabledModels } : {}),
   }));
 }
 
@@ -227,18 +251,9 @@ function resolveGatewayAgent(name: string, config: ResolvedAcpxConfig): GatewayA
   }
   const normalizedAgentName = normalizeAgentName(name);
   const canonicalAgentName = resolveCanonicalAgentName(name);
-  const configuredAgent = Object.hasOwn(config.agents, normalizedAgentName)
-    ? config.agents[normalizedAgentName]
-    : Object.hasOwn(config.agents, canonicalAgentName)
-      ? config.agents[canonicalAgentName]
-      : undefined;
+  const configuredAgent = resolveConfiguredAgent(config, normalizedAgentName, canonicalAgentName);
   if (configuredAgent) {
-    return {
-      name,
-      agentCommand: configuredAgent.command,
-      ...(configuredAgent.argv ? { agentArgv: [...configuredAgent.argv] } : {}),
-      ...(configuredAgent.env ? { env: { ...configuredAgent.env } } : {}),
-    };
+    return toGatewayAgentSpec(name, configuredAgent);
   }
   const agentArgv = resolveAgentArgv(name);
   return {
@@ -246,6 +261,20 @@ function resolveGatewayAgent(name: string, config: ResolvedAcpxConfig): GatewayA
     agentCommand: resolveAgentCommandFromRegistry(name),
     ...(agentArgv ? { agentArgv } : {}),
   };
+}
+
+function resolveConfiguredAgent(
+  config: ResolvedAcpxConfig,
+  normalizedAgentName: string,
+  canonicalAgentName: string,
+): ResolvedAgentConfig | undefined {
+  if (Object.hasOwn(config.agents, normalizedAgentName)) {
+    return config.agents[normalizedAgentName];
+  }
+  if (Object.hasOwn(config.agents, canonicalAgentName)) {
+    return config.agents[canonicalAgentName];
+  }
+  return undefined;
 }
 
 /** True when the agent's launch argv runs an `acpx gateway` process. */
@@ -266,32 +295,48 @@ function splitCommandTokens(command: string): string[] {
 export type GatewayConfigSelection = {
   agents: GatewayAgentSpec[];
   defaultAgent: string;
+  /** Merged-surface allowlist taken from the config's own `acpx gateway` entries. */
+  gatewayEnabledModels?: string[];
 };
 
 /**
  * Every enabled config agent except gateway launches; the first entry in config
  * order is the default. Config agents whose launch runs an `acpx gateway`
- * process are excluded so a config-driven gateway does not spawn itself.
+ * process are excluded so a config-driven gateway does not spawn itself; their
+ * `enabledModels` entries filter the merged model surface instead.
  */
 export function resolveGatewayAgentsFromConfig(config: ResolvedAcpxConfig): GatewayConfigSelection {
   const specs: GatewayAgentSpec[] = [];
+  const gatewayEnabledModels: string[] = [];
   for (const [name, entry] of Object.entries(config.agents)) {
     if (isGatewayProcessLaunch(entry)) {
+      gatewayEnabledModels.push(...(entry.enabledModels ?? []));
       continue;
     }
-    specs.push({
-      name,
-      agentCommand: entry.command,
-      ...(entry.argv ? { agentArgv: [...entry.argv] } : {}),
-      ...(entry.env ? { env: { ...entry.env } } : {}),
-    });
+    specs.push(toGatewayAgentSpec(name, entry));
   }
   if (specs.length === 0) {
     throw new InvalidArgumentError(
       `No agents to serve: define agents in ${config.globalPath} or ${config.projectPath}; agents whose launch runs an acpx gateway process are excluded to avoid recursion`,
     );
   }
-  return { agents: specs, defaultAgent: specs[0].name };
+  return {
+    agents: specs,
+    defaultAgent: specs[0].name,
+    ...(gatewayEnabledModels.length > 0
+      ? { gatewayEnabledModels: [...new Set(gatewayEnabledModels)] }
+      : {}),
+  };
+}
+
+function toGatewayAgentSpec(name: string, entry: ResolvedAgentConfig): GatewayAgentSpec {
+  return {
+    name,
+    agentCommand: entry.command,
+    ...(entry.argv ? { agentArgv: [...entry.argv] } : {}),
+    ...(entry.env ? { env: { ...entry.env } } : {}),
+    ...(entry.enabledModels ? { enabledModels: [...entry.enabledModels] } : {}),
+  };
 }
 
 export function registerGatewayCommand(program: Command, config: ResolvedAcpxConfig): void {
@@ -319,6 +364,7 @@ export function registerGatewayCommand(program: Command, config: ResolvedAcpxCon
 
       let specs: GatewayAgentSpec[];
       let defaultAgent: string | undefined;
+      let gatewayEnabledModels: string[] | undefined;
       if (flags.config !== undefined) {
         const parsed = await loadGatewayConfigFile(flags.config);
         specs = parsed.agents;
@@ -327,6 +373,7 @@ export function registerGatewayCommand(program: Command, config: ResolvedAcpxCon
         const selection = resolveGatewayAgentsFromConfig(config);
         specs = selection.agents;
         defaultAgent = selection.defaultAgent;
+        gatewayEnabledModels = selection.gatewayEnabledModels;
       } else {
         specs = agents.map((name) => resolveGatewayAgent(name, config));
       }
@@ -336,6 +383,7 @@ export function registerGatewayCommand(program: Command, config: ResolvedAcpxCon
       process.exitCode = await runAcpGateway({
         agents: specs,
         ...(defaultAgent !== undefined ? { defaultAgent } : {}),
+        ...(gatewayEnabledModels !== undefined ? { enabledModels: gatewayEnabledModels } : {}),
         cwd: path.resolve(flags.cwd ?? process.cwd()),
         permissionMode,
         verbose: flags.verbose === true,

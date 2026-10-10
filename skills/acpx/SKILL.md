@@ -84,7 +84,11 @@ If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdi
 `gateway` serves multiple agents as one ACP server over stdio; route sessions
 with `session/new` `_meta {acpx:{agent}}`. With no agents and no `--config`, it
 serves every enabled agent from the main config (config agents whose launch
-runs an `acpx gateway` process are excluded); the first is the default.
+runs an `acpx gateway` process are excluded); the first is the default. Each
+agent entry accepts an optional `enabledModels` array of bare model ids that
+whitelists what that backend advertises; an `enabledModels` entry on the
+gateway's own `acpx-gateway` config agent filters the merged surface across
+every backend. See `docs/gateway.md#model-allowlists` for the contract.
 
 ## Built-in agent registry
 

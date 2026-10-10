@@ -46,6 +46,7 @@ import {
 import {
   isModelSelectOption,
   modelStateFromSessionResponse,
+  RequestedModelUnsupportedError,
   type SessionModelState,
 } from "./model-support.js";
 
@@ -62,12 +63,19 @@ export type GatewayAgentSpec = {
   agentCommand: string;
   agentArgv?: string[];
   env?: Record<string, string>;
+  /** Bare model-id allowlist for this backend; absent means every model. */
+  enabledModels?: string[];
 };
 
 export type RunAcpGatewayOptions = {
   agents: GatewayAgentSpec[];
   /** Agent name used when session/new has no _meta selection; defaults to the first agent. */
   defaultAgent?: string;
+  /**
+   * Prefixed `<agent>/<model>` allowlist applied to the merged model surface;
+   * typically the `enabledModels` of the config's own `acpx gateway` entry.
+   */
+  enabledModels?: string[];
   cwd: string;
   permissionMode: PermissionMode;
   verbose?: boolean;
@@ -87,6 +95,8 @@ type GatewayClientState = {
   /** downstream session id -> gateway session id */
   sessionRoutes: Map<string, string>;
   discovery?: BackendDiscovery;
+  /** Bare model-id allowlist for this backend's models; undefined means all. */
+  enabledModels?: ReadonlySet<string>;
 };
 
 /**
@@ -131,17 +141,35 @@ function modelRef(agentName: string, modelId: string): string {
   return `${agentName}/${modelId}`;
 }
 
+/** Narrows a backend's model state to the allowed bare model ids. */
+function filterModelState(
+  models: SessionModelState,
+  allowed: ReadonlySet<string> | undefined,
+): SessionModelState {
+  if (!allowed) {
+    return models;
+  }
+  const availableModels = models.availableModels.filter((model) => allowed.has(model.modelId));
+  const currentModelId = allowed.has(models.currentModelId)
+    ? models.currentModelId
+    : (availableModels[0]?.modelId ?? models.currentModelId);
+  return { ...models, currentModelId, availableModels };
+}
+
 export class AcpGateway implements Agent {
   private readonly clients = new Map<string, GatewayClientState>();
   private readonly sessions = new Map<string, GatewaySession>();
   private readonly defaultAgentName: string;
+  /** Prefixed model refs allowed on the merged surface; undefined means all. */
+  private readonly mergedAllowlist?: ReadonlySet<string>;
   private readonly log: (message: string) => void;
   private connection?: AgentConnection;
 
   constructor(
-    agents: Array<{ name: string; client: AcpClient }>,
+    agents: Array<{ name: string; client: AcpClient; enabledModels?: ReadonlySet<string> }>,
     defaultAgentName: string,
     log: (message: string) => void = () => {},
+    enabledModels?: ReadonlySet<string>,
   ) {
     if (agents.length === 0) {
       throw new Error("Gateway requires at least one agent");
@@ -151,12 +179,14 @@ export class AcpGateway implements Agent {
         name: agent.name,
         client: agent.client,
         sessionRoutes: new Map<string, string>(),
+        ...(agent.enabledModels ? { enabledModels: agent.enabledModels } : {}),
       });
     }
     if (!this.clients.has(defaultAgentName)) {
       throw new Error(`Default agent is not part of the gateway: ${defaultAgentName}`);
     }
     this.defaultAgentName = defaultAgentName;
+    this.mergedAllowlist = enabledModels;
     this.log = log;
   }
 
@@ -236,7 +266,7 @@ export class AcpGateway implements Agent {
       return this.translateModeUpdate(state, session, record, update);
     }
     if (record.sessionUpdate === "config_option_update" && Array.isArray(record.configOptions)) {
-      return this.translateConfigOptionUpdate(session, record);
+      return this.translateConfigOptionUpdate(state, session, record);
     }
     return update;
   }
@@ -261,6 +291,7 @@ export class AcpGateway implements Agent {
   }
 
   private translateConfigOptionUpdate(
+    state: GatewayClientState,
     session: GatewaySession,
     record: Record<string, unknown>,
   ): SessionNotification["update"] {
@@ -270,7 +301,7 @@ export class AcpGateway implements Agent {
       response: undefined,
     });
     if (models) {
-      session.backendModels = models;
+      session.backendModels = filterModelState(models, state.enabledModels);
     }
     return {
       ...record,
@@ -437,7 +468,9 @@ export class AcpGateway implements Agent {
     session.state = state;
     session.downstreamSessionId = created.sessionId;
     session.backendConfigOptions = created.configOptions ?? state.discovery?.configOptions ?? [];
-    session.backendModels = created.models ?? state.discovery?.models;
+    session.backendModels = created.models
+      ? filterModelState(created.models, state.enabledModels)
+      : state.discovery?.models;
     if (state.discovery) {
       session.unifiedPermission = resolveUnifiedCurrentPermission(state.discovery.mode);
     }
@@ -459,11 +492,18 @@ export class AcpGateway implements Agent {
         `Agent "${agentName}" does not advertise selectable models`,
       );
     }
-    const response = await state.client.setSessionModel(
-      session.downstreamSessionId!,
-      modelId,
-      models,
-    );
+    let response: Awaited<ReturnType<typeof state.client.setSessionModel>>;
+    try {
+      response = await state.client.setSessionModel(session.downstreamSessionId!, modelId, models);
+    } catch (error) {
+      if (error instanceof RequestedModelUnsupportedError) {
+        throw new RequestError(
+          INVALID_PARAMS_ERROR_CODE,
+          `Agent "${agentName}" did not advertise model "${modelId}". Available models: ${models.availableModels.map((model) => model.modelId).join(", ")}`,
+        );
+      }
+      throw error;
+    }
     this.updateBackendOptions(session, response);
     await this.replayBuffered(session);
     return { configOptions: this.boundConfigOptions(session) };
@@ -565,7 +605,7 @@ export class AcpGateway implements Agent {
       response,
     });
     if (models) {
-      session.backendModels = models;
+      session.backendModels = filterModelState(models, session.state?.enabledModels);
     }
   }
 
@@ -620,14 +660,12 @@ export class AcpGateway implements Agent {
       if (!models) {
         continue;
       }
-      for (const model of models.availableModels) {
-        options.push({
-          value: modelRef(state.name, model.modelId),
-          name: `${state.name}: ${model.name}`,
-        });
-      }
+      this.collectMergedOptions(state, models, options);
       if (state.name === this.defaultAgentName) {
-        current = modelRef(state.name, models.currentModelId);
+        const defaultRef = modelRef(state.name, models.currentModelId);
+        if (this.mergedAllows(defaultRef)) {
+          current = defaultRef;
+        }
       }
     }
     if (options.length === 0) {
@@ -641,6 +679,27 @@ export class AcpGateway implements Agent {
       currentValue: current ?? options[0].value,
       options,
     };
+  }
+
+  private collectMergedOptions(
+    state: GatewayClientState,
+    models: SessionModelState,
+    options: Array<{ value: string; name: string }>,
+  ): void {
+    for (const model of models.availableModels) {
+      const ref = modelRef(state.name, model.modelId);
+      if (!this.mergedAllows(ref)) {
+        continue;
+      }
+      options.push({
+        value: ref,
+        name: `${state.name}: ${model.name}`,
+      });
+    }
+  }
+
+  private mergedAllows(ref: string): boolean {
+    return !this.mergedAllowlist || this.mergedAllowlist.has(ref);
   }
 
   private dropSession(session: GatewaySession): void {
@@ -669,7 +728,12 @@ function dedupeAgents(agents: GatewayAgentSpec[]): GatewayAgentSpec[] {
   const seen = new Set<string>();
   const unique: GatewayAgentSpec[] = [];
   for (const agent of agents) {
-    const key = JSON.stringify([agent.agentCommand, agent.agentArgv ?? [], agent.env ?? {}]);
+    const key = JSON.stringify([
+      agent.agentCommand,
+      agent.agentArgv ?? [],
+      agent.env ?? {},
+      agent.enabledModels ?? [],
+    ]);
     if (seen.has(key)) {
       continue;
     }
@@ -711,7 +775,7 @@ async function probeBackends(
       const created = await state.client.createSession(cwd);
       discovery = {
         configOptions: created.configOptions ?? [],
-        models: created.models,
+        models: created.models ? filterModelState(created.models, state.enabledModels) : undefined,
         mode: resolveBackendModeSupport({
           configOptions: created.configOptions,
           modes: created.modes,
@@ -743,6 +807,7 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
   if (agents.length === 0) {
     throw new Error("Gateway requires at least one agent");
   }
+  const enabledModels = options.enabledModels ? new Set<string>(options.enabledModels) : undefined;
 
   let gatewayRef: AcpGateway | undefined;
 
@@ -765,14 +830,20 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
         },
       }),
       sessionRoutes: new Map<string, string>(),
+      ...(agent.enabledModels ? { enabledModels: new Set<string>(agent.enabledModels) } : {}),
     };
     states.push(state);
   }
 
   const gateway = new AcpGateway(
-    states.map((state) => ({ name: state.name, client: state.client })),
+    states.map((state) => ({
+      name: state.name,
+      client: state.client,
+      ...(state.enabledModels ? { enabledModels: state.enabledModels } : {}),
+    })),
     options.defaultAgent ?? states[0].name,
     log,
+    enabledModels,
   );
   gatewayRef = gateway;
 

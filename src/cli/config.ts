@@ -22,6 +22,8 @@ export type ResolvedAgentConfig = {
   command: string;
   argv?: string[];
   env?: Record<string, string>;
+  /** Model allowlist; empty/absent means every advertised model is allowed. */
+  enabledModels?: string[];
 };
 
 /** A single `agents.<name>` entry: launch details and/or an explicit enabled flag. */
@@ -31,8 +33,8 @@ type ParsedAgentEntry = {
 };
 
 type ConfigAgentEntry =
-  | { command: string; env?: Record<string, string> }
-  | { argv: string[]; env?: Record<string, string> };
+  | { command: string; env?: Record<string, string>; enabledModels?: string[] }
+  | { argv: string[]; env?: Record<string, string>; enabledModels?: string[] };
 
 type ConfigFileShape = {
   defaultAgent?: unknown;
@@ -249,13 +251,49 @@ function parseAgentEntry(raw: unknown, name: string, sourcePath: string): Parsed
     return { enabled };
   }
   const env = parseAgentEnv(raw.env, name, sourcePath);
+  const enabledModels = parseAgentEnabledModels(raw.enabledModels, name, sourcePath);
   const entry = Object.prototype.hasOwnProperty.call(raw, "argv")
     ? parseArgvAgentEntry(raw, name, sourcePath)
     : parseLegacyAgentEntry(raw, name, sourcePath);
   return {
-    launch: env ? { ...entry, env } : entry,
+    launch: mergeAgentLaunchExtras(entry, env, enabledModels),
     ...(enabled !== undefined ? { enabled } : {}),
   };
+}
+
+function mergeAgentLaunchExtras(
+  entry: ResolvedAgentConfig,
+  env: Record<string, string> | undefined,
+  enabledModels: string[] | undefined,
+): ResolvedAgentConfig {
+  if (!env && !enabledModels) {
+    return entry;
+  }
+  return {
+    ...entry,
+    ...(env ? { env } : {}),
+    ...(enabledModels ? { enabledModels } : {}),
+  };
+}
+
+function parseAgentEnabledModels(
+  value: unknown,
+  agentName: string,
+  sourcePath: string,
+): string[] | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.some((item) => typeof item !== "string" || item.trim().length === 0)
+  ) {
+    throw new Error(
+      `Invalid config agents.${agentName}.enabledModels in ${sourcePath}: expected non-empty array of non-empty strings`,
+    );
+  }
+  return [...new Set(value as string[])];
 }
 
 function hasLaunchFields(raw: Record<string, unknown>): boolean {
@@ -690,8 +728,16 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
     Object.entries(config.agents).map(([name, agent]) => [
       name,
       agent.argv
-        ? { argv: [...agent.argv], ...(agent.env ? { env: { ...agent.env } } : {}) }
-        : { command: agent.command, ...(agent.env ? { env: { ...agent.env } } : {}) },
+        ? {
+            argv: [...agent.argv],
+            ...(agent.env ? { env: { ...agent.env } } : {}),
+            ...(agent.enabledModels ? { enabledModels: [...agent.enabledModels] } : {}),
+          }
+        : {
+            command: agent.command,
+            ...(agent.env ? { env: { ...agent.env } } : {}),
+            ...(agent.enabledModels ? { enabledModels: [...agent.enabledModels] } : {}),
+          },
     ]),
   );
 

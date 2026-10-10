@@ -344,6 +344,11 @@ acpx [global_options] gateway --config <path> [--cwd <dir>] [--approve-all | --a
   [Custom agents](custom-agents.md).
 - Upstream stdin EOF retires all agent processes and exits `0`; SIGINT/SIGTERM
   exit `130`. Sessions live in gateway memory for the process lifetime only.
+- Each agent entry accepts an optional `enabledModels` array of bare model
+  ids that whitelists what that backend advertises through the gateway; an
+  `enabledModels` entry on the gateway's own `acpx-gateway` config agent
+  filters the merged surface across every backend. See
+  [Gateway](gateway.md#model-allowlists) for details.
 
 See [Gateway](gateway.md) for the full behavior contract and limitations.
 

@@ -638,6 +638,70 @@ test("loadResolvedConfig rejects invalid agent env entries", async () => {
   });
 });
 
+test("loadResolvedConfig parses agent enabledModels and surfaces it in display", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            custom: {
+              argv: ["./bin/my-agent", "acp"],
+              enabledModels: ["m-b", "m-a", "m-b"],
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const config = await loadResolvedConfig(cwd);
+    assert.deepEqual(config.agents.custom.enabledModels, ["m-b", "m-a"]);
+    assert.deepEqual(toConfigDisplay(config).agents.custom.enabledModels, ["m-b", "m-a"]);
+  });
+});
+
+test("loadResolvedConfig rejects invalid agent enabledModels entries", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+
+    const cases: Array<{ enabledModels: unknown; pattern: RegExp }> = [
+      {
+        enabledModels: "m-a",
+        pattern: /Invalid config agents\.custom\.enabledModels\b.*expected non-empty array/u,
+      },
+      {
+        enabledModels: [],
+        pattern: /Invalid config agents\.custom\.enabledModels\b.*expected non-empty array/u,
+      },
+      {
+        enabledModels: ["m-a", 1],
+        pattern: /Invalid config agents\.custom\.enabledModels\b.*expected non-empty array/u,
+      },
+      {
+        enabledModels: ["m-a", ""],
+        pattern: /Invalid config agents\.custom\.enabledModels\b.*expected non-empty array/u,
+      },
+    ];
+
+    for (const { enabledModels, pattern } of cases) {
+      await fs.writeFile(
+        path.join(homeDir, ".acpx", "config.json"),
+        `${JSON.stringify({ agents: { custom: { command: "./bin/my-agent", enabledModels } } })}\n`,
+        "utf8",
+      );
+      await assert.rejects(() => loadResolvedConfig(cwd), pattern);
+    }
+  });
+});
+
 test("loadResolvedConfig separates agents disabled with enabled: false", async () => {
   await withTempEnv(async ({ homeDir }) => {
     const cwd = path.join(homeDir, "workspace");

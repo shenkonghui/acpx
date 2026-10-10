@@ -94,6 +94,11 @@ Rules:
   `_meta.acpx.agent` but contributes no models or modes to the merged surface.
 - Duplicate agent commands are deduplicated: two names resolving to the same
   command share one process.
+- An entry may carry an `enabledModels` array of bare model ids to whitelist
+  what that backend advertises (see [Model allowlists](#model-allowlists)
+  below). The legacy `--config` file does not support the special
+  `acpx-gateway` merged-surface allowlist — define the gateway agent in the
+  main config for that.
 - Permission flags apply to every session through the gateway. Permissions,
   filesystem, and terminal callbacks are answered by the gateway itself; they
   are not forwarded upstream.
@@ -161,6 +166,43 @@ upstream with the gateway session id substituted.
   per-agent synonym table (`default`→`ask`, `auto`/`acceptEdits`→`code`,
   `bypassPermissions`/`full-access`→`bypass`). A backend that advertises no
   matching mode accepts the value without forwarding it.
+
+## Model allowlists
+
+Each agent entry accepts an optional `enabledModels` array of bare model ids
+(no `<agent>/` prefix). The gateway applies it at three points:
+
+- During backend probing, so the merged selector on `session/new` only lists
+  allowed models for that agent.
+- On a bound session, so `session/set_config_option` for `model` only offers
+  the allowed subset and selecting a filtered-out model is rejected with an
+  invalid-params error.
+- On downstream `session/update` notifications, so models added later by an
+  adapter still respect the allowlist.
+
+An `enabledModels` entry on the gateway's own `acpx-gateway` config agent is
+special: because that agent is excluded from the backend list (it would
+recurse), its bare ids are interpreted as prefixed `<agent>/<model>` refs and
+filter the **merged** surface across every backend. Use this to publish only a
+curated subset of the full backend catalog to upstream clients.
+
+```json
+{
+  "agents": {
+    "cb": {
+      "argv": ["codebuddy", "--acp"],
+      "enabledModels": ["deepseek-v4.1-flash"]
+    },
+    "acpx-gateway": {
+      "argv": ["acpx", "gateway"],
+      "enabledModels": ["cb/deepseek-v4.1-flash", "qoder-cn/qfmodel"]
+    }
+  }
+}
+```
+
+Direct `acpx <agent>` calls still see every advertised model; `enabledModels`
+is honored by `acpx gateway` only.
 
 ## Lifecycle
 

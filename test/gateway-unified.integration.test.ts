@@ -278,7 +278,12 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
   }
 }
 
-type GatewayAgentConfig = { name: string; argv: string[]; default?: boolean };
+type GatewayAgentConfig = {
+  name: string;
+  argv: string[];
+  default?: boolean;
+  enabledModels?: string[];
+};
 
 function defaultGatewayAgents(scriptPath: string): GatewayAgentConfig[] {
   return [
@@ -498,6 +503,73 @@ test("gateway: unknown model reference is rejected", async () => {
       },
     );
   });
+});
+
+test("gateway: enabledModels filters backend models on the merged and bound surfaces", async () => {
+  await withGateway(
+    async (harness, cwd) => {
+      await initializeGateway(harness);
+      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+
+      // Merged surface: alpha is restricted to alpha-2, beta and gamma are untouched.
+      assert.deepEqual(selectValues(findOption(session.configOptions, "model")).toSorted(), [
+        "alpha/alpha-2",
+        "beta/beta-1",
+        "gamma/gamma-1",
+        "gamma/gamma-2",
+        "gamma/gamma-3",
+      ]);
+
+      // Bound surface: a session bound to alpha sees only the allowed model.
+      const bound = await harness.connection.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: { acpx: { agent: AGENT_ALPHA } },
+      });
+      assert.deepEqual(selectValues(findOption(bound.configOptions, "model")), ["alpha/alpha-2"]);
+
+      // Selecting a filtered-out model is rejected by the advertised-model check.
+      await assert.rejects(
+        harness.connection.setSessionConfigOption({
+          sessionId: bound.sessionId,
+          configId: "model",
+          value: "alpha/alpha-1",
+        }),
+        (error: unknown) => {
+          const message = (error as { message?: unknown }).message;
+          return typeof message === "string" && message.includes("did not advertise");
+        },
+      );
+    },
+    (scriptPath) => [
+      {
+        name: AGENT_ALPHA,
+        argv: agentArgv(
+          scriptPath,
+          AGENT_ALPHA,
+          "alpha-1,alpha-2",
+          "read-only,auto,full-access,plan,default",
+          "config",
+        ),
+        enabledModels: ["alpha-2"],
+        default: true,
+      },
+      {
+        name: AGENT_BETA,
+        argv: agentArgv(
+          scriptPath,
+          AGENT_BETA,
+          "beta-1",
+          "read-only,auto,full-access,plan,default",
+          "config",
+        ),
+      },
+      {
+        name: AGENT_GAMMA,
+        argv: agentArgv(scriptPath, AGENT_GAMMA, "gamma-1,gamma-2,gamma-3", "auto,plan", "sdk"),
+      },
+    ],
+  );
 });
 
 test("gateway: a backend whose probe fails is degraded, not fatal", async () => {
