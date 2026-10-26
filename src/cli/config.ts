@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { renderArgvIdentity } from "../acp/client-process.js";
+import type { FallbackEntry } from "../acp/gateway-failover.js";
 import {
   DEFAULT_AGENT_NAME,
   normalizeAgentName,
@@ -46,6 +47,7 @@ type ConfigFileShape = {
   queueMaxDepth?: unknown;
   format?: unknown;
   agents?: unknown;
+  fallbacks?: unknown;
   auth?: unknown;
   disableExec?: unknown;
   mcpServers?: unknown;
@@ -63,6 +65,8 @@ export type ResolvedAcpxConfig = {
   agents: Record<string, ResolvedAgentConfig>;
   /** Normalized names explicitly disabled with `enabled: false` in the config. */
   disabledAgents: string[];
+  /** Priority-ordered failover chain; absent means the gateway never fails over. */
+  fallbacks?: FallbackEntry[];
   auth: Record<string, string>;
   disableExec: boolean;
   mcpServers: McpServer[];
@@ -294,6 +298,109 @@ function parseAgentEnabledModels(
     );
   }
   return [...new Set(value as string[])];
+}
+
+type ParsedFallbackEntry = {
+  agent: string;
+  model?: string;
+  priority?: number;
+};
+
+function requireFallbackAgent(value: unknown, entryLabel: string, sourcePath: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Invalid ${entryLabel}.agent in ${sourcePath}: expected non-empty string`);
+  }
+  return value.trim();
+}
+
+function optionalFallbackModel(
+  value: unknown,
+  entryLabel: string,
+  sourcePath: string,
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Invalid ${entryLabel}.model in ${sourcePath}: expected non-empty string`);
+  }
+  return value.trim();
+}
+
+function optionalFallbackPriority(
+  value: unknown,
+  entryLabel: string,
+  sourcePath: string,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error(`Invalid ${entryLabel}.priority in ${sourcePath}: expected integer`);
+  }
+  return value;
+}
+
+function parseFallbackEntry(
+  raw: unknown,
+  index: number,
+  sourcePath: string,
+  label: string,
+): ParsedFallbackEntry {
+  const entryLabel = `${label}[${index}]`;
+  if (!isObject(raw)) {
+    throw new Error(`Invalid ${entryLabel} in ${sourcePath}: expected object`);
+  }
+  const entry: ParsedFallbackEntry = {
+    agent: requireFallbackAgent(raw.agent, entryLabel, sourcePath),
+  };
+  const model = optionalFallbackModel(raw.model, entryLabel, sourcePath);
+  if (model !== undefined) {
+    entry.model = model;
+  }
+  const priority = optionalFallbackPriority(raw.priority, entryLabel, sourcePath);
+  if (priority !== undefined) {
+    entry.priority = priority;
+  }
+  return entry;
+}
+
+/**
+ * Parses the `fallbacks` chain.
+ *
+ * An entry without an explicit priority slots in just below the previous one,
+ * so a chain without priorities keeps the configured order and a chain that
+ * pins some entries keeps those pins.
+ */
+export function parseFallbackEntries(
+  value: unknown,
+  sourcePath: string,
+  label = "config",
+): FallbackEntry[] | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid ${label} fallbacks in ${sourcePath}: expected array`);
+  }
+  if (value.length === 0) {
+    return undefined;
+  }
+  const parsed = value.map((raw, index) => parseFallbackEntry(raw, index, sourcePath, label));
+  const total = parsed.length;
+  let previous: number | undefined;
+  return parsed.map((entry) => {
+    const priority = entry.priority ?? (previous === undefined ? total : previous - 1);
+    previous = priority;
+    const fallback: FallbackEntry = {
+      agent: entry.agent,
+      priority,
+    };
+    if (entry.model) {
+      fallback.model = entry.model;
+    }
+    return fallback;
+  });
 }
 
 function hasLaunchFields(raw: Record<string, unknown>): boolean {
@@ -580,11 +687,13 @@ export async function loadResolvedConfig(
     explicitMcp.path,
   );
   const disableExec = resolveScalar("disableExec", parseDisableExec, DEFAULT_DISABLE_EXEC);
+  const fallbacks = resolveScalar("fallbacks", parseFallbackEntries, undefined);
 
   return {
     ...scalar,
     agents,
     disabledAgents,
+    ...(fallbacks ? { fallbacks } : {}),
     auth,
     disableExec,
     mcpServers,
@@ -721,6 +830,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
   format: OutputFormat;
   agents: Record<string, ConfigAgentEntry>;
   disabledAgents: string[];
+  fallbacks?: FallbackEntry[];
   authMethods: string[];
   disableExec: boolean;
 } {
@@ -752,6 +862,7 @@ export function toConfigDisplay(config: ResolvedAcpxConfig): {
     format: config.format,
     agents,
     disabledAgents: [...config.disabledAgents],
+    ...(config.fallbacks ? { fallbacks: config.fallbacks.map((entry) => ({ ...entry })) } : {}),
     authMethods: Object.keys(config.auth).toSorted(),
     disableExec: config.disableExec,
   };

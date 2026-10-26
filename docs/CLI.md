@@ -25,8 +25,8 @@ acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
 acpx [global_options] compare <agent>... '<prompt_text>'
 acpx [global_options] compare <agent>... --file <path>
-acpx [global_options] gateway [agents...] [--approve-all | --approve-reads | --deny-all] [--verbose]
-acpx [global_options] gateway --config <path> [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway [agents...] [--handoff] [--health-check-interval <minutes>] [--health-check-probe <optimistic|canary>] [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway --config <path> [--handoff] [--health-check-interval <minutes>] [--health-check-probe <optimistic|canary>] [--approve-all | --approve-reads | --deny-all] [--verbose]
 acpx [global_options] registry list [--format <fmt>]
 acpx [global_options] registry show <agent-id> [--format <fmt>]
 acpx [global_options] registry install <agent-id> [--method binary|npx|uvx] [--as <name>] [--force] [--format <fmt>]
@@ -327,8 +327,8 @@ listed agent at startup, routes each `session/new` to the agent named in
 notifications upstream with gateway session ids:
 
 ```bash
-acpx [global_options] gateway [agents...] [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
-acpx [global_options] gateway --config <path> [--cwd <dir>] [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway [agents...] [--cwd <dir>] [--handoff] [--handoff-turns <count>] [--handoff-max-chars <count>] [--health-check-interval <minutes>] [--health-check-probe <optimistic|canary>] [--approve-all | --approve-reads | --deny-all] [--verbose]
+acpx [global_options] gateway --config <path> [--cwd <dir>] [--handoff] [--health-check-interval <minutes>] [--health-check-probe <optimistic|canary>] [--approve-all | --approve-reads | --deny-all] [--verbose]
 ```
 
 - With no agents and no `--config`, the gateway serves every enabled agent from
@@ -337,8 +337,26 @@ acpx [global_options] gateway --config <path> [--cwd <dir>] [--approve-all | --a
 - `--config <path>` loads the agent list from a JSON file (mutually exclusive
   with positional agents); entries carry a friendly `name` used for
   `_meta.acpx.agent` selection. See [Gateway](gateway.md) for the file format.
-- Only `--cwd`, `--config`, permission flags, and `--verbose` are accepted;
-  stdout carries ACP protocol traffic only.
+- `--cwd`, `--config`, `--handoff`, `--handoff-turns`, `--handoff-max-chars`,
+  `--health-check-interval`, `--health-check-probe`, permission flags, and
+  `--verbose` are accepted; stdout carries ACP protocol traffic only.
+- `--handoff` migrates the conversation to another backend when a bound session
+  selects that backend's model, instead of rejecting the switch. The merged
+  model selector stays visible after binding and the current value points at the
+  bound model; the structured handoff prompt carries the plan, recent tool
+  paths, and the last N turns. Migration is refused mid-turn and rolls back to
+  the old agent on failure. See [Gateway](gateway.md#session-handoff).
+- A `fallbacks` chain in the config (or in the `--config` file) makes the
+  gateway degrade to the next healthy backend when the current one crashes,
+  runs out of quota, or refuses the request for missing authentication. The
+  chain is priority-ordered, the failed turn is replayed once on the new
+  backend, and the client receives the updated model.
+- `--health-check-interval <minutes>` (default `60`) sets how often unhealthy
+  backends are checked; a recovered backend is respawned and sessions move
+  back to it. `--health-check-probe <optimistic|canary>` decides whether a
+  recovered backend is verified by a real probe request (canary) or trusted
+  right away (optimistic, default). Both flags only matter with a `fallbacks`
+  chain. See [Gateway](gateway.md#fallback-chain).
 - The first agent (or the entry with `"default": true` in a config file) is the
   default for sessions created without `_meta`; agent resolution follows
   [Custom agents](custom-agents.md).

@@ -27,8 +27,29 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { EXIT_CODES, type PermissionMode } from "../types.js";
+import { EXIT_CODES, type AcpProcessExit, type PermissionMode } from "../types.js";
 import { AcpClient } from "./client.js";
+import type { SessionCreateResult } from "./client.js";
+import { classifyAgentFailure, isFailoverEligible } from "./failure-classification.js";
+import {
+  DEFAULT_HEALTH_CHECK_INTERVAL_MS,
+  type FallbackEntry,
+  FailoverController,
+  type FailoverRestoreMode,
+} from "./gateway-failover.js";
+import {
+  appendNote,
+  appendUserMessage,
+  createHandoffHistory,
+  DEFAULT_HANDOFF_MAX_CHARS,
+  DEFAULT_HANDOFF_TURNS,
+  type GatewayHandoffOptions,
+  type HandoffHistory,
+  type HandoffMessage,
+  promptText,
+  recordDownstreamUpdate,
+  renderHandoffPrompt,
+} from "./gateway-handoff.js";
 import { asRecord } from "./jsonrpc.js";
 import {
   type BackendModeSupport,
@@ -79,6 +100,20 @@ export type RunAcpGatewayOptions = {
   cwd: string;
   permissionMode: PermissionMode;
   verbose?: boolean;
+  /**
+   * Enables structured session handoff: selecting another backend's model on a
+   * bound session migrates the conversation instead of being rejected.
+   */
+  handoff?: GatewayHandoffOptions;
+  /**
+   * Ordered failover chain. When a backend fails, the session moves to the
+   * next healthy entry; absent means every failure reaches the client.
+   */
+  fallbacks?: FallbackEntry[];
+  /** Interval between backend health checks (default 60 minutes). */
+  healthCheckIntervalMs?: number;
+  /** How a degraded backend is confirmed before it serves again. */
+  restoreMode?: FailoverRestoreMode;
 };
 
 /** What a backend advertised during startup probing. */
@@ -111,6 +146,14 @@ type GatewaySession = {
   downstreamSessionId?: string;
   /** Set while a bind is in flight so concurrent control calls serialize behind it. */
   bindPromise?: Promise<void>;
+  /** Set while a handoff migration is in flight so control calls wait for it. */
+  migration?: Promise<void>;
+  /** True while the handoff prompt runs on the target backend; its output is dropped. */
+  migrating?: boolean;
+  /** Number of prompts currently running on the bound backend. */
+  pendingPrompts: number;
+  /** Structured conversation summary used to migrate to another backend. */
+  history: HandoffHistory;
   /** Unified permission currently exposed to the client. */
   unifiedPermission: UnifiedPermission;
   /** Latest config options reported by the bound backend. */
@@ -121,6 +164,10 @@ type GatewaySession = {
   bufferedMode?: UnifiedPermission;
   /** Other config options set before binding, replayed once bound. */
   bufferedConfigOptions: Array<{ configId: string; value: string }>;
+  /** Downstream updates relayed to the client; guards the automatic retry. */
+  relayedUpdates: number;
+  /** Backend the session was on before a failover moved it elsewhere. */
+  failoverOrigin?: { agent: string; model?: string };
 };
 
 function resolveRequestedAgentName(meta: NewSessionRequest["_meta"]): string | undefined {
@@ -156,21 +203,33 @@ function filterModelState(
   return { ...models, currentModelId, availableModels };
 }
 
+export type AcpGatewayOptions = {
+  agents: Array<{ name: string; client: AcpClient; enabledModels?: ReadonlySet<string> }>;
+  defaultAgentName: string;
+  log?: (message: string) => void;
+  /** Prefixed model refs allowed on the merged surface; undefined means all. */
+  enabledModels?: ReadonlySet<string>;
+  /** Structured session handoff; absent keeps cross-backend switches rejected. */
+  handoff?: Required<GatewayHandoffOptions>;
+  /** Failover chain; absent keeps every failure on the current backend. */
+  failover?: FailoverController;
+};
+
 export class AcpGateway implements Agent {
   private readonly clients = new Map<string, GatewayClientState>();
   private readonly sessions = new Map<string, GatewaySession>();
   private readonly defaultAgentName: string;
   /** Prefixed model refs allowed on the merged surface; undefined means all. */
   private readonly mergedAllowlist?: ReadonlySet<string>;
+  private readonly handoff?: Required<GatewayHandoffOptions>;
+  /** Handoff settings used by internal migrations; set whenever failover can move a session. */
+  private readonly migrationHandoff?: Required<GatewayHandoffOptions>;
+  private readonly failover?: FailoverController;
   private readonly log: (message: string) => void;
   private connection?: AgentConnection;
 
-  constructor(
-    agents: Array<{ name: string; client: AcpClient; enabledModels?: ReadonlySet<string> }>,
-    defaultAgentName: string,
-    log: (message: string) => void = () => {},
-    enabledModels?: ReadonlySet<string>,
-  ) {
+  constructor(options: AcpGatewayOptions) {
+    const { agents, defaultAgentName, enabledModels } = options;
     if (agents.length === 0) {
       throw new Error("Gateway requires at least one agent");
     }
@@ -187,7 +246,14 @@ export class AcpGateway implements Agent {
     }
     this.defaultAgentName = defaultAgentName;
     this.mergedAllowlist = enabledModels;
-    this.log = log;
+    this.handoff = options.handoff;
+    this.failover = options.failover;
+    this.migrationHandoff =
+      this.handoff ??
+      (this.failover
+        ? { recentTurns: DEFAULT_HANDOFF_TURNS, maxChars: DEFAULT_HANDOFF_MAX_CHARS }
+        : undefined);
+    this.log = options.log ?? (() => {});
   }
 
   attachConnection(connection: AgentConnection): void {
@@ -226,6 +292,14 @@ export class AcpGateway implements Agent {
     return session;
   }
 
+  /**
+   * Backend a new session lands on: the healthiest chain entry when a
+   * failover chain is configured, otherwise the configured default agent.
+   */
+  private resolveDefaultAgent(): string {
+    return this.failover?.preferredAgent() ?? this.defaultAgentName;
+  }
+
   async relayUpdate(agentName: string, notification: SessionNotification): Promise<void> {
     const state = this.clients.get(agentName);
     if (!state) {
@@ -245,6 +319,18 @@ export class AcpGateway implements Agent {
       this.log(`update dropped: no route for ${notification.sessionId}`);
       return;
     }
+    const session = this.sessions.get(gatewaySessionId);
+    if (!session) {
+      this.log(`update dropped: unknown gateway session ${gatewaySessionId}`);
+      return;
+    }
+    if (session.migrating) {
+      // The handoff prompt runs before the route is exposed; its output belongs
+      // to the migration handshake, not to the user-visible conversation.
+      return;
+    }
+    session.relayedUpdates += 1;
+    recordDownstreamUpdate(session.history, notification.update);
     await connection.sessionUpdate({
       sessionId: gatewaySessionId,
       update: this.translateUpdate(state, gatewaySessionId, notification.update),
@@ -334,7 +420,10 @@ export class AcpGateway implements Agent {
       gatewaySessionId,
       cwd: params.cwd,
       unifiedPermission: DEFAULT_UNIFIED_PERMISSION,
+      pendingPrompts: 0,
+      history: createHandoffHistory(),
       bufferedConfigOptions: [],
+      relayedUpdates: 0,
     };
 
     if (requestedName) {
@@ -345,7 +434,7 @@ export class AcpGateway implements Agent {
       return { sessionId: gatewaySessionId, configOptions: this.boundConfigOptions(session) };
     }
 
-    const defaultState = this.clients.get(this.defaultAgentName);
+    const defaultState = this.clients.get(this.resolveDefaultAgent());
     if (defaultState?.discovery) {
       session.unifiedPermission = resolveUnifiedCurrentPermission(defaultState.discovery.mode);
     }
@@ -355,6 +444,7 @@ export class AcpGateway implements Agent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const session = this.requireSession(params.sessionId);
+    await this.settleMigration(session);
     if (!session.state || !session.downstreamSessionId) {
       throw new RequestError(
         INVALID_PARAMS_ERROR_CODE,
@@ -367,6 +457,7 @@ export class AcpGateway implements Agent {
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const session = this.requireSession(params.sessionId);
+    await this.settleMigration(session);
     if (!session.state || !session.downstreamSessionId) {
       throw new RequestError(
         INVALID_PARAMS_ERROR_CODE,
@@ -379,6 +470,7 @@ export class AcpGateway implements Agent {
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     const session = this.requireSession(params.sessionId);
+    await this.settleMigration(session);
     if (session.state && session.downstreamSessionId) {
       await session.state.client.closeSession(session.downstreamSessionId);
     }
@@ -388,12 +480,90 @@ export class AcpGateway implements Agent {
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.requireSession(params.sessionId);
-    if (!session.state || !session.downstreamSessionId) {
-      await this.bindSession(session, this.defaultAgentName);
-      // A client may have chosen a permission before prompting without a model.
-      await this.replayBuffered(session);
+    await this.settleMigration(session);
+    const historyLength = session.history.messages.length;
+    appendUserMessage(session.history, promptText(params.prompt));
+    session.pendingPrompts += 1;
+    try {
+      if (!session.state || !session.downstreamSessionId) {
+        await this.bindSession(session, this.resolveDefaultAgent());
+        // A client may have chosen a permission before prompting without a model.
+        await this.replayBuffered(session);
+      }
+      const relayedBefore = session.relayedUpdates;
+      try {
+        return await session.state!.client.prompt(session.downstreamSessionId!, params.prompt);
+      } catch (error) {
+        return await this.recoverFromPromptFailure(session, error, params.prompt, {
+          relayedBefore,
+          historyLength,
+        });
+      }
+    } finally {
+      session.pendingPrompts -= 1;
     }
-    return await session.state!.client.prompt(session.downstreamSessionId!, params.prompt);
+  }
+
+  /**
+   * Moves a failed turn to the next healthy backend and replays it there.
+   *
+   * The turn is only replayed when it produced no downstream output: once a
+   * backend has streamed something, the turn may have had side effects and a
+   * second attempt could duplicate them.
+   */
+  private async recoverFromPromptFailure(
+    session: GatewaySession,
+    error: unknown,
+    prompt: PromptRequest["prompt"],
+    context: { relayedBefore: number; historyLength: number },
+  ): Promise<PromptResponse> {
+    const failover = this.failover;
+    const state = session.state;
+    if (!failover || !state) {
+      throw error;
+    }
+    const failure = classifyAgentFailure(error);
+    if (!isFailoverEligible(failure)) {
+      this.log(`session ${session.gatewaySessionId} failed (${failure.class}): ${failure.reason}`);
+      throw error;
+    }
+    failover.markFailure(state.name, failure);
+    const target = failover.preferredEntry(state.name);
+    if (!target) {
+      this.log(`session ${session.gatewaySessionId} failed over: no healthy backend left`);
+      throw error;
+    }
+    if (session.relayedUpdates !== context.relayedBefore) {
+      this.log(
+        `session ${session.gatewaySessionId} failed after streaming output; not replaying on ${target.agent}`,
+      );
+      throw error;
+    }
+    try {
+      await this.migrateSession(session, target, context.historyLength);
+    } catch (migrationError) {
+      this.log(
+        `session ${session.gatewaySessionId} could not move to ${target.agent}: ${String(migrationError)}`,
+      );
+      throw error;
+    }
+    this.log(
+      `session ${session.gatewaySessionId} failed over from ${state.name} to ${target.agent}`,
+    );
+    await this.notifyConfigOptions(session);
+    try {
+      return await session.state!.client.prompt(session.downstreamSessionId!, prompt);
+    } catch (retryError) {
+      failover.markFailure(session.state!.name, classifyAgentFailure(retryError));
+      throw retryError;
+    }
+  }
+
+  /** Waits for an in-flight handoff so later control calls hit the new backend. */
+  private async settleMigration(session: GatewaySession): Promise<void> {
+    if (session.migration) {
+      await session.migration;
+    }
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -406,6 +576,7 @@ export class AcpGateway implements Agent {
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const session = this.requireSession(params.sessionId);
+    await this.settleMigration(session);
     await this.applyUnifiedMode(session, params.modeId);
     return {};
   }
@@ -414,6 +585,7 @@ export class AcpGateway implements Agent {
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.requireSession(params.sessionId);
+    await this.settleMigration(session);
     const rawValue = typeof params.value === "boolean" ? String(params.value) : params.value;
     if (params.configId === UNIFIED_MODEL_CONFIG_ID) {
       return await this.applyModelSelection(session, rawValue);
@@ -483,6 +655,9 @@ export class AcpGateway implements Agent {
     ref: string,
   ): Promise<SetSessionConfigOptionResponse> {
     const { agentName, modelId } = this.resolveModelRef(ref);
+    if (session.state && session.state.name !== agentName) {
+      return await this.switchBackend(session, agentName, modelId);
+    }
     await this.bindSession(session, agentName);
     const state = session.state!;
     const models = session.backendModels ?? state.discovery?.models;
@@ -507,6 +682,372 @@ export class AcpGateway implements Agent {
     this.updateBackendOptions(session, response);
     await this.replayBuffered(session);
     return { configOptions: this.boundConfigOptions(session) };
+  }
+
+  /**
+   * Moves a bound session to another backend when structured handoff is on.
+   * The old binding is kept until the new session has accepted the model and the
+   * handoff prompt, so a failure leaves the session usable on the old agent.
+   */
+  private async switchBackend(
+    session: GatewaySession,
+    agentName: string,
+    modelId: string,
+  ): Promise<SetSessionConfigOptionResponse> {
+    if (!this.handoff) {
+      throw new RequestError(
+        INVALID_PARAMS_ERROR_CODE,
+        `Session is already bound to agent "${session.state?.name}"; switching to "${agentName}" is not supported`,
+      );
+    }
+    if (session.migration) {
+      await session.migration;
+      if (session.state?.name === agentName) {
+        return { configOptions: this.boundConfigOptions(session) };
+      }
+      return await this.switchBackend(session, agentName, modelId);
+    }
+    if (session.pendingPrompts > 0) {
+      throw new RequestError(
+        INVALID_PARAMS_ERROR_CODE,
+        `Cannot switch session from agent "${session.state?.name}" to "${agentName}" while a turn is running`,
+      );
+    }
+    const migration = this.performMigration(session, agentName, modelId);
+    // Never reject the shared promise: the initiating caller observes the error
+    // through `migration`, while concurrent control calls only wait for it.
+    session.migration = migration.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      await migration;
+    } finally {
+      session.migration = undefined;
+    }
+    return { configOptions: this.boundConfigOptions(session) };
+  }
+
+  private async performMigration(
+    session: GatewaySession,
+    agentName: string,
+    modelId: string | undefined,
+    options?: { handoffMessages?: HandoffMessage[] },
+  ): Promise<void> {
+    const source = session.state;
+    const sourceSessionId = session.downstreamSessionId;
+    if (!source || !sourceSessionId) {
+      throw new RequestError(INVALID_PARAMS_ERROR_CODE, "Session is not bound to an agent yet");
+    }
+    const target = this.requireClient(agentName);
+    const created = await this.createMigrationSession(session, target, agentName);
+    session.migrating = true;
+    target.sessionRoutes.set(created.sessionId, session.gatewaySessionId);
+    try {
+      const applied = await this.applyMigrationModel(target, created, agentName, modelId);
+      await this.runHandoffPrompt(
+        session,
+        target,
+        created.sessionId,
+        source.name,
+        agentName,
+        options?.handoffMessages,
+      );
+      this.commitMigration(session, {
+        source,
+        sourceSessionId,
+        target,
+        createdSessionId: created.sessionId,
+        modelId,
+        applied,
+      });
+      await this.applyPermissionAfterMigration(session);
+      await this.closeQuietly(source, sourceSessionId);
+      this.log(`migrated session ${session.gatewaySessionId} from ${source.name} to ${agentName}`);
+    } catch (error) {
+      target.sessionRoutes.delete(created.sessionId);
+      await this.closeQuietly(target, created.sessionId);
+      throw error;
+    } finally {
+      session.migrating = false;
+    }
+  }
+
+  private async createMigrationSession(
+    session: GatewaySession,
+    target: GatewayClientState,
+    agentName: string,
+  ): Promise<SessionCreateResult> {
+    try {
+      return await target.client.createSession(session.cwd);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new RequestError(
+        INVALID_PARAMS_ERROR_CODE,
+        `Failed to start agent "${agentName}" for session handoff: ${message}`,
+      );
+    }
+  }
+
+  private async applyMigrationModel(
+    target: GatewayClientState,
+    created: SessionCreateResult,
+    agentName: string,
+    modelId: string | undefined,
+  ): Promise<{
+    models?: SessionModelState;
+    response: SetSessionConfigOptionResponse | undefined;
+    createdConfigOptions?: SessionConfigOption[];
+  }> {
+    const models = created.models
+      ? filterModelState(created.models, target.enabledModels)
+      : target.discovery?.models;
+    if (!modelId) {
+      // No pinned model: the new session keeps the backend's own default.
+      return {
+        models,
+        response: undefined,
+        ...(created.configOptions ? { createdConfigOptions: created.configOptions } : {}),
+      };
+    }
+    if (!models) {
+      throw new RequestError(
+        INVALID_PARAMS_ERROR_CODE,
+        `Agent "${agentName}" does not advertise selectable models`,
+      );
+    }
+    const response = await this.requestMigrationModel(target, created, agentName, modelId, models);
+    return {
+      models,
+      response,
+      ...(created.configOptions ? { createdConfigOptions: created.configOptions } : {}),
+    };
+  }
+
+  private async requestMigrationModel(
+    target: GatewayClientState,
+    created: SessionCreateResult,
+    agentName: string,
+    modelId: string,
+    models: SessionModelState,
+  ): Promise<SetSessionConfigOptionResponse | undefined> {
+    try {
+      return await target.client.setSessionModel(created.sessionId, modelId, models);
+    } catch (error) {
+      if (error instanceof RequestedModelUnsupportedError) {
+        throw new RequestError(
+          INVALID_PARAMS_ERROR_CODE,
+          `Agent "${agentName}" did not advertise model "${modelId}". Available models: ${models.availableModels.map((model) => model.modelId).join(", ")}`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async runHandoffPrompt(
+    session: GatewaySession,
+    target: GatewayClientState,
+    downstreamSessionId: string,
+    fromAgent: string,
+    toAgent: string,
+    messages?: HandoffMessage[],
+  ): Promise<void> {
+    const handoff = this.migrationHandoff;
+    if (!handoff) {
+      return;
+    }
+    const history: HandoffHistory = messages ? { ...session.history, messages } : session.history;
+    if (history.messages.length === 0) {
+      return;
+    }
+    const prompt = renderHandoffPrompt({
+      fromAgent,
+      toAgent,
+      history,
+      recentTurns: handoff.recentTurns,
+      maxChars: handoff.maxChars,
+    });
+    await target.client.prompt(downstreamSessionId, prompt);
+  }
+
+  private commitMigration(
+    session: GatewaySession,
+    input: {
+      source: GatewayClientState;
+      sourceSessionId: string;
+      target: GatewayClientState;
+      createdSessionId: string;
+      modelId: string | undefined;
+      applied: {
+        models?: SessionModelState;
+        response: SetSessionConfigOptionResponse | undefined;
+        createdConfigOptions?: SessionConfigOption[];
+      };
+    },
+  ): void {
+    const { source, sourceSessionId, target, createdSessionId, modelId, applied } = input;
+    source.sessionRoutes.delete(sourceSessionId);
+    session.state = target;
+    session.downstreamSessionId = createdSessionId;
+    const configOptions = this.migratedConfigOptions(target, applied);
+    session.backendConfigOptions = configOptions;
+    session.backendModels = this.migratedModels(target, applied, configOptions, modelId);
+    appendNote(session.history, `Session migrated from "${source.name}" to "${target.name}".`);
+  }
+
+  private migratedConfigOptions(
+    target: GatewayClientState,
+    applied: {
+      response: SetSessionConfigOptionResponse | undefined;
+      createdConfigOptions?: SessionConfigOption[];
+    },
+  ): SessionConfigOption[] {
+    return (
+      applied.response?.configOptions ??
+      applied.createdConfigOptions ??
+      target.discovery?.configOptions ??
+      []
+    );
+  }
+
+  private migratedModels(
+    target: GatewayClientState,
+    applied: {
+      models?: SessionModelState;
+      response: SetSessionConfigOptionResponse | undefined;
+    },
+    configOptions: SessionConfigOption[],
+    modelId: string | undefined,
+  ): SessionModelState | undefined {
+    const advertised =
+      modelStateFromSessionResponse({ configOptions, response: applied.response }) ??
+      applied.models;
+    if (!advertised) {
+      return undefined;
+    }
+    const current = modelId ? { ...advertised, currentModelId: modelId } : advertised;
+    return filterModelState(current, target.enabledModels);
+  }
+
+  /** Best-effort permission replay onto the new backend; a failure is not fatal. */
+  private async applyPermissionAfterMigration(session: GatewaySession): Promise<void> {
+    try {
+      await this.forwardUnifiedMode(session, session.unifiedPermission);
+    } catch (error) {
+      this.log(`handoff permission not applied: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Moves a session onto a failover chain entry. The conversation travels with
+   * it; the failed turn is excluded so it is not replayed twice.
+   */
+  private async migrateSession(
+    session: GatewaySession,
+    target: FallbackEntry,
+    historyLength?: number,
+  ): Promise<void> {
+    this.requireClient(target.agent);
+    const origin = session.failoverOrigin ?? {
+      agent: session.state?.name ?? target.agent,
+      ...(session.backendModels?.currentModelId
+        ? { model: session.backendModels.currentModelId }
+        : {}),
+    };
+    const handoffMessages =
+      historyLength === undefined ? undefined : session.history.messages.slice(0, historyLength);
+    await this.performMigration(
+      session,
+      target.agent,
+      target.model,
+      handoffMessages ? { handoffMessages } : undefined,
+    );
+    session.failoverOrigin = origin;
+  }
+
+  /** Tells the client which models and modes the session exposes now. */
+  private async notifyConfigOptions(session: GatewaySession): Promise<void> {
+    const connection = this.connection;
+    if (!connection) {
+      return;
+    }
+    await connection.sessionUpdate({
+      sessionId: session.gatewaySessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: this.boundConfigOptions(session),
+      },
+    });
+  }
+
+  /**
+   * Moves sessions that failed over back to a recovered, higher-priority
+   * backend. Sessions the client placed on a lower-priority agent are left
+   * alone: only a failover leaves a trail to follow back.
+   */
+  async restoreFailedOverSessions(): Promise<void> {
+    const failover = this.failover;
+    if (!failover) {
+      return;
+    }
+    for (const session of this.sessions.values()) {
+      const origin = session.failoverOrigin;
+      if (!origin || !this.canRestoreSession(session, failover)) {
+        continue;
+      }
+      await this.restoreSession(session, origin);
+    }
+  }
+
+  /** True when the session may move back to a recovered higher-priority backend. */
+  private canRestoreSession(session: GatewaySession, failover: FailoverController): boolean {
+    const origin = session.failoverOrigin;
+    if (!origin || !session.state || !session.downstreamSessionId) {
+      return false;
+    }
+    if (session.pendingPrompts > 0 || session.migration) {
+      return false;
+    }
+    if (!failover.isHealthy(origin.agent)) {
+      return false;
+    }
+    return failover.rankOf(origin.agent) < failover.rankOf(session.state.name);
+  }
+
+  private async restoreSession(
+    session: GatewaySession,
+    origin: { agent: string; model?: string },
+  ): Promise<void> {
+    const state = this.clients.get(origin.agent);
+    if (!state) {
+      return;
+    }
+    const models = state.discovery?.models;
+    const modelId =
+      origin.model && models?.availableModels.some((model) => model.modelId === origin.model)
+        ? origin.model
+        : undefined;
+    try {
+      await this.performMigration(session, origin.agent, modelId);
+      session.failoverOrigin = undefined;
+      this.log(`session ${session.gatewaySessionId} restored to ${origin.agent}`);
+      await this.notifyConfigOptions(session);
+    } catch (error) {
+      this.log(
+        `session ${session.gatewaySessionId} could not return to ${origin.agent}: ${String(error)}`,
+      );
+    }
+  }
+
+  private async closeQuietly(state: GatewayClientState, sessionId: string): Promise<void> {
+    if (!state.client.supportsCloseSession()) {
+      return;
+    }
+    try {
+      await state.client.closeSession(sessionId);
+    } catch (error) {
+      this.log(`handoff close failed for ${state.name}/${sessionId}: ${String(error)}`);
+    }
   }
 
   private async applyUnifiedMode(
@@ -636,49 +1177,78 @@ export class AcpGateway implements Agent {
 
   /** Config options exposed after a session is bound, with models prefixed and mode unified. */
   private boundConfigOptions(session: GatewaySession): SessionConfigOption[] {
-    const state = session.state;
     const options: SessionConfigOption[] = [];
-    if (state && session.backendModels) {
-      options.push(buildModelOption(state.name, session.backendModels));
+    const modelOption = this.boundModelOption(session);
+    if (modelOption) {
+      options.push(modelOption);
     }
     options.push(buildUnifiedModeOption(session.unifiedPermission));
     for (const option of session.backendConfigOptions ?? []) {
-      const record = asRecord(option);
-      if (!record || isModelSelectOption(record) || isModeSelectOption(record)) {
-        continue;
+      if (isPassthroughConfigOption(option)) {
+        options.push(option);
       }
-      options.push(option);
     }
     return options;
   }
 
-  private mergedModelOption(): SessionConfigOption | undefined {
-    const options: Array<{ value: string; name: string }> = [];
-    let current: string | undefined;
-    for (const state of this.clients.values()) {
-      const models = state.discovery?.models;
-      if (!models) {
-        continue;
-      }
-      this.collectMergedOptions(state, models, options);
-      if (state.name === this.defaultAgentName) {
-        const defaultRef = modelRef(state.name, models.currentModelId);
-        if (this.mergedAllows(defaultRef)) {
-          current = defaultRef;
-        }
-      }
-    }
-    if (options.length === 0) {
+  /**
+   * A bound session normally advertises only its backend's models. With handoff
+   * enabled the merged surface stays visible so the client can request a switch.
+   */
+  private boundModelOption(session: GatewaySession): SessionConfigOption | undefined {
+    const state = session.state;
+    if (!state || !session.backendModels) {
       return undefined;
+    }
+    const currentRef = modelRef(state.name, session.backendModels.currentModelId);
+    if (!this.handoff) {
+      return buildModelOption(state.name, session.backendModels);
+    }
+    return this.mergedModelOption(currentRef);
+  }
+
+  private mergedModelOption(currentRef?: string): SessionConfigOption | undefined {
+    const surface = this.mergedSurface();
+    const currentValue = currentRef ?? surface.defaultCurrent ?? surface.options[0]?.value;
+    if (!currentValue) {
+      return undefined;
+    }
+    if (!surface.options.some((option) => option.value === currentValue)) {
+      // A session bound through _meta may sit on a model outside the merged
+      // allowlist; keep the current value selectable so clients can render it.
+      surface.options.unshift({ value: currentValue, name: currentValue });
     }
     return {
       id: UNIFIED_MODEL_CONFIG_ID,
       name: "Model",
       category: "model",
       type: "select",
-      currentValue: current ?? options[0].value,
-      options,
+      currentValue,
+      options: surface.options,
     };
+  }
+
+  private mergedSurface(): {
+    options: Array<{ value: string; name: string }>;
+    defaultCurrent?: string;
+  } {
+    const options: Array<{ value: string; name: string }> = [];
+    let defaultCurrent: string | undefined;
+    const defaultAgentName = this.resolveDefaultAgent();
+    for (const state of this.clients.values()) {
+      const models = state.discovery?.models;
+      if (!models) {
+        continue;
+      }
+      this.collectMergedOptions(state, models, options);
+      if (state.name === defaultAgentName) {
+        const defaultRef = modelRef(state.name, models.currentModelId);
+        if (this.mergedAllows(defaultRef)) {
+          defaultCurrent = defaultRef;
+        }
+      }
+    }
+    return { options, ...(defaultCurrent ? { defaultCurrent } : {}) };
   }
 
   private collectMergedOptions(
@@ -724,6 +1294,15 @@ function buildModelOption(agentName: string, models: SessionModelState): Session
   };
 }
 
+/** Passes through backend options that are neither a model nor a mode selector. */
+function isPassthroughConfigOption(option: SessionConfigOption): boolean {
+  const record = asRecord(option);
+  if (!record) {
+    return false;
+  }
+  return !isModelSelectOption(record) && !isModeSelectOption(record);
+}
+
 function dedupeAgents(agents: GatewayAgentSpec[]): GatewayAgentSpec[] {
   const seen = new Set<string>();
   const unique: GatewayAgentSpec[] = [];
@@ -756,8 +1335,27 @@ async function startAgents(
 }
 
 /**
- * Probes each backend once to learn its models and modes. The probe session is
+ * Probes a backend once to learn its models and modes. The probe session is
  * closed when the backend supports it, otherwise it lingers route-less.
+ */
+async function probeBackend(state: GatewayClientState, cwd: string): Promise<BackendDiscovery> {
+  const created = await state.client.createSession(cwd);
+  const discovery: BackendDiscovery = {
+    configOptions: created.configOptions ?? [],
+    models: created.models ? filterModelState(created.models, state.enabledModels) : undefined,
+    mode: resolveBackendModeSupport({
+      configOptions: created.configOptions,
+      modes: created.modes,
+    }),
+  };
+  if (state.client.supportsCloseSession()) {
+    await state.client.closeSession(created.sessionId);
+  }
+  return discovery;
+}
+
+/**
+ * Probes each backend once to learn its models and modes.
  *
  * A backend whose probe fails (for example an agent that needs auth before
  * `session/new`) is degraded rather than fatal: it is kept reachable via
@@ -772,18 +1370,7 @@ async function probeBackends(
   for (const state of states) {
     let discovery: BackendDiscovery;
     try {
-      const created = await state.client.createSession(cwd);
-      discovery = {
-        configOptions: created.configOptions ?? [],
-        models: created.models ? filterModelState(created.models, state.enabledModels) : undefined,
-        mode: resolveBackendModeSupport({
-          configOptions: created.configOptions,
-          modes: created.modes,
-        }),
-      };
-      if (state.client.supportsCloseSession()) {
-        await state.client.closeSession(created.sessionId);
-      }
+      discovery = await probeBackend(state, cwd);
     } catch (error) {
       discovery = { configOptions: [], mode: { setPath: "none", advertisedIds: [] } };
       log(`probe failed for agent ${state.name}: ${String(error)} (no models advertised)`);
@@ -796,54 +1383,211 @@ async function probeBackends(
   }
 }
 
-export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<number> {
-  const log = (message: string): void => {
-    if (options.verbose) {
-      process.stderr.write(`[acpx gateway] ${message}\n`);
-    }
+function createGatewayLogger(verbose: boolean | undefined): (message: string) => void {
+  if (!verbose) {
+    return () => {};
+  }
+  return (message: string): void => {
+    process.stderr.write(`[acpx gateway] ${message}\n`);
   };
+}
 
+function resolveHandoffOptions(
+  handoff: GatewayHandoffOptions | undefined,
+): Required<GatewayHandoffOptions> | undefined {
+  if (!handoff) {
+    return undefined;
+  }
+  return {
+    recentTurns: handoff.recentTurns ?? DEFAULT_HANDOFF_TURNS,
+    maxChars: handoff.maxChars ?? DEFAULT_HANDOFF_MAX_CHARS,
+  };
+}
+
+function createClientState(
+  agent: GatewayAgentSpec,
+  options: RunAcpGatewayOptions,
+  onSessionUpdate: (notification: SessionNotification) => void,
+  onProcessExit: (exit: AcpProcessExit) => void,
+): GatewayClientState {
+  return {
+    name: agent.name,
+    client: new AcpClient({
+      agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
+      cwd: options.cwd,
+      permissionMode: options.permissionMode,
+      ...(agent.env ? { sessionOptions: { env: agent.env } } : {}),
+      processLifecycle: { onExit: onProcessExit },
+      verbose: options.verbose,
+      suppressSdkConsoleErrors: true,
+      onSessionUpdate,
+    }),
+    sessionRoutes: new Map<string, string>(),
+    ...(agent.enabledModels ? { enabledModels: new Set<string>(agent.enabledModels) } : {}),
+  };
+}
+
+function buildGateway(
+  states: GatewayClientState[],
+  options: RunAcpGatewayOptions,
+  log: (message: string) => void,
+  enabledModels: ReadonlySet<string> | undefined,
+  handoff: Required<GatewayHandoffOptions> | undefined,
+  failover: FailoverController | undefined,
+): AcpGateway {
+  return new AcpGateway({
+    agents: states.map((state) => ({
+      name: state.name,
+      client: state.client,
+      ...(state.enabledModels ? { enabledModels: state.enabledModels } : {}),
+    })),
+    defaultAgentName: options.defaultAgent ?? states[0].name,
+    log,
+    ...(enabledModels ? { enabledModels } : {}),
+    ...(handoff ? { handoff } : {}),
+    ...(failover ? { failover } : {}),
+  });
+}
+
+/**
+ * Builds the failover controller for a configured chain.
+ *
+ * Without a chain the gateway behaves exactly as before: no health state, no
+ * timer, and every backend failure reaches the client unchanged.
+ */
+function createFailoverController(input: {
+  fallbacks: readonly FallbackEntry[];
+  agents: string[];
+  statesByName: Map<string, GatewayClientState>;
+  cwd: string;
+  log: (message: string) => void;
+  getGateway: () => AcpGateway | undefined;
+  healthCheckIntervalMs?: number;
+  restoreMode?: FailoverRestoreMode;
+}): FailoverController | undefined {
+  const { fallbacks, agents, statesByName, cwd, log, getGateway } = input;
+  if (fallbacks.length === 0) {
+    return undefined;
+  }
+  const served = new Set(agents);
+  for (const entry of fallbacks) {
+    if (!served.has(entry.agent)) {
+      throw new Error(
+        `Fallback agent "${entry.agent}" is not served by this gateway (available: ${[...served].join(", ")})`,
+      );
+    }
+  }
+  return new FailoverController({
+    policy: {
+      entries: [...fallbacks],
+      healthCheckIntervalMs: input.healthCheckIntervalMs ?? DEFAULT_HEALTH_CHECK_INTERVAL_MS,
+      restoreMode: input.restoreMode ?? "optimistic",
+    },
+    agents,
+    log,
+    hooks: {
+      respawn: async (agent) => {
+        const state = statesByName.get(agent);
+        if (!state) {
+          return false;
+        }
+        try {
+          await state.client.start();
+          const discovery = await probeBackend(state, cwd);
+          state.discovery = discovery;
+          getGateway()?.setBackendDiscovery(agent, discovery);
+          log(`respawned agent ${agent}`);
+          return true;
+        } catch (error) {
+          log(`respawn failed for agent ${agent}: ${String(error)}`);
+          return false;
+        }
+      },
+      verify: async (agent) => {
+        const state = statesByName.get(agent);
+        if (!state) {
+          return false;
+        }
+        let sessionId: string | undefined;
+        try {
+          const created = await state.client.createSession(cwd);
+          sessionId = created.sessionId;
+          await state.client.prompt(created.sessionId, "ping");
+          return true;
+        } catch (error) {
+          log(`canary probe failed for agent ${agent}: ${String(error)}`);
+          return false;
+        } finally {
+          if (sessionId && state.client.supportsCloseSession()) {
+            try {
+              await state.client.closeSession(sessionId);
+            } catch (error) {
+              log(`canary probe cleanup failed for agent ${agent}: ${String(error)}`);
+            }
+          }
+        }
+      },
+    },
+    afterTick: async () => {
+      await getGateway()?.restoreFailedOverSessions();
+    },
+  });
+}
+
+export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<number> {
+  const log = createGatewayLogger(options.verbose);
   const agents = dedupeAgents(options.agents);
   if (agents.length === 0) {
     throw new Error("Gateway requires at least one agent");
   }
   const enabledModels = options.enabledModels ? new Set<string>(options.enabledModels) : undefined;
+  const fallbacks = options.fallbacks ?? [];
 
   let gatewayRef: AcpGateway | undefined;
-
-  const states: GatewayClientState[] = [];
-  for (const agent of agents) {
-    const state: GatewayClientState = {
-      name: agent.name,
-      client: new AcpClient({
-        agentCommand: agent.agentCommand,
-        agentArgv: agent.agentArgv,
-        cwd: options.cwd,
-        permissionMode: options.permissionMode,
-        ...(agent.env ? { sessionOptions: { env: agent.env } } : {}),
-        verbose: options.verbose,
-        suppressSdkConsoleErrors: true,
-        onSessionUpdate: (notification) => {
-          void gatewayRef?.relayUpdate(agent.name, notification).catch((error: unknown) => {
-            log(`session update relay failed: ${String(error)}`);
-          });
-        },
-      }),
-      sessionRoutes: new Map<string, string>(),
-      ...(agent.enabledModels ? { enabledModels: new Set<string>(agent.enabledModels) } : {}),
-    };
-    states.push(state);
-  }
-
-  const gateway = new AcpGateway(
-    states.map((state) => ({
-      name: state.name,
-      client: state.client,
-      ...(state.enabledModels ? { enabledModels: state.enabledModels } : {}),
-    })),
-    options.defaultAgent ?? states[0].name,
+  let failoverRef: FailoverController | undefined;
+  let closing = false;
+  const states = agents.map((agent) =>
+    createClientState(
+      agent,
+      options,
+      (notification) => {
+        void gatewayRef?.relayUpdate(agent.name, notification).catch((error: unknown) => {
+          log(`session update relay failed: ${String(error)}`);
+        });
+      },
+      (exit) => {
+        if (closing) {
+          return;
+        }
+        failoverRef?.markDown(
+          agent.name,
+          `agent process exited (code ${exit.exitCode ?? "unknown"}, signal ${exit.signal ?? "none"})`,
+        );
+      },
+    ),
+  );
+  const statesByName = new Map(states.map((state) => [state.name, state]));
+  const failover = createFailoverController({
+    fallbacks,
+    agents: states.map((state) => state.name),
+    statesByName,
+    cwd: options.cwd,
+    log,
+    getGateway: () => gatewayRef,
+    ...(options.healthCheckIntervalMs !== undefined
+      ? { healthCheckIntervalMs: options.healthCheckIntervalMs }
+      : {}),
+    ...(options.restoreMode !== undefined ? { restoreMode: options.restoreMode } : {}),
+  });
+  failoverRef = failover;
+  const gateway = buildGateway(
+    states,
+    options,
     log,
     enabledModels,
+    resolveHandoffOptions(options.handoff),
+    failover,
   );
   gatewayRef = gateway;
 
@@ -855,10 +1599,13 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
     await Promise.allSettled(started.map((state) => state.client.close()));
     throw error;
   }
+  failover?.start();
 
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = (): Promise<void> => {
     shutdownPromise ??= (async () => {
+      closing = true;
+      failover?.stop();
       log("shutting down; retiring all agents");
       await Promise.allSettled(states.map((state) => state.client.close()));
     })();

@@ -2,6 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { renderArgvIdentity, splitCommandLine } from "../acp/client-process.js";
+import {
+  type FallbackEntry,
+  type FailoverRestoreMode,
+  DEFAULT_HEALTH_CHECK_INTERVAL_MS,
+} from "../acp/gateway-failover.js";
+import { DEFAULT_HANDOFF_MAX_CHARS, DEFAULT_HANDOFF_TURNS } from "../acp/gateway-handoff.js";
 import type { GatewayAgentSpec } from "../acp/gateway.js";
 import {
   normalizeAgentName,
@@ -9,7 +15,12 @@ import {
   resolveAgentCommand as resolveAgentCommandFromRegistry,
   resolveCanonicalAgentName,
 } from "../agent-registry.js";
-import { isAgentDisabled, type ResolvedAcpxConfig, type ResolvedAgentConfig } from "./config.js";
+import {
+  isAgentDisabled,
+  parseFallbackEntries,
+  type ResolvedAcpxConfig,
+  type ResolvedAgentConfig,
+} from "./config.js";
 import { parseNonEmptyValue, resolvePermissionMode } from "./flags.js";
 import type { PermissionFlags } from "./flags.js";
 
@@ -17,7 +28,31 @@ export type GatewayFlags = PermissionFlags & {
   cwd?: string;
   verbose?: boolean;
   config?: string;
+  handoff?: boolean;
+  handoffTurns?: number;
+  handoffMaxChars?: number;
+  healthCheckInterval?: number;
+  healthCheckProbe?: FailoverRestoreMode;
 };
+
+const DEFAULT_HEALTH_CHECK_INTERVAL_MINUTES = DEFAULT_HEALTH_CHECK_INTERVAL_MS / 60_000;
+
+function parsePositiveInteger(label: string) {
+  return (value: string): number => {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new InvalidArgumentError(`${label} must be a positive integer`);
+    }
+    return parsed;
+  };
+}
+
+function parseRestoreMode(value: string): FailoverRestoreMode {
+  if (value !== "optimistic" && value !== "canary") {
+    throw new InvalidArgumentError("--health-check-probe must be optimistic or canary");
+  }
+  return value;
+}
 
 type GatewayFileAgentEntry = {
   name: string;
@@ -166,6 +201,7 @@ function parseEntryEnabledModels(
 export type ParsedGatewayConfig = {
   agents: GatewayAgentSpec[];
   defaultAgent: string;
+  fallbacks?: FallbackEntry[];
 };
 
 function assertUniqueAgentNames(entries: GatewayFileAgentEntry[], sourcePath: string): void {
@@ -211,6 +247,12 @@ export function parseGatewayConfig(raw: unknown, sourcePath: string): ParsedGate
       `Invalid gateway config agents in ${sourcePath}: expected non-empty array`,
     );
   }
+  let fallbacks: FallbackEntry[] | undefined;
+  try {
+    fallbacks = parseFallbackEntries(raw.fallbacks, sourcePath, "gateway config");
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
   const entries = agentsRaw.map((entry, index) =>
     parseGatewayFileAgentEntry(entry, index, sourcePath),
   );
@@ -218,12 +260,13 @@ export function parseGatewayConfig(raw: unknown, sourcePath: string): ParsedGate
   return {
     agents: toAgentSpecs(entries),
     defaultAgent: resolveDefaultAgentName(entries, sourcePath),
+    ...(fallbacks ? { fallbacks } : {}),
   };
 }
 
 async function loadGatewayConfigFile(
   configPath: string,
-): Promise<{ agents: GatewayAgentSpec[]; defaultAgent: string }> {
+): Promise<{ agents: GatewayAgentSpec[]; defaultAgent: string; fallbacks?: FallbackEntry[] }> {
   let rawContent: string;
   try {
     rawContent = await fs.readFile(configPath, "utf8");
@@ -297,6 +340,8 @@ export type GatewayConfigSelection = {
   defaultAgent: string;
   /** Merged-surface allowlist taken from the config's own `acpx gateway` entries. */
   gatewayEnabledModels?: string[];
+  /** Priority-ordered failover chain from the config's `fallbacks` key. */
+  fallbacks?: FallbackEntry[];
 };
 
 /**
@@ -326,6 +371,7 @@ export function resolveGatewayAgentsFromConfig(config: ResolvedAcpxConfig): Gate
     ...(gatewayEnabledModels.length > 0
       ? { gatewayEnabledModels: [...new Set(gatewayEnabledModels)] }
       : {}),
+    ...(config.fallbacks ? { fallbacks: config.fallbacks.map((entry) => ({ ...entry })) } : {}),
   };
 }
 
@@ -336,6 +382,57 @@ function toGatewayAgentSpec(name: string, entry: ResolvedAgentConfig): GatewayAg
     ...(entry.argv ? { agentArgv: [...entry.argv] } : {}),
     ...(entry.env ? { env: { ...entry.env } } : {}),
     ...(entry.enabledModels ? { enabledModels: [...entry.enabledModels] } : {}),
+  };
+}
+
+export type GatewayTargets = {
+  specs: GatewayAgentSpec[];
+  defaultAgent?: string;
+  gatewayEnabledModels?: string[];
+  fallbacks?: FallbackEntry[];
+};
+
+async function resolveGatewayTargets(
+  flags: GatewayFlags,
+  agents: string[],
+  config: ResolvedAcpxConfig,
+): Promise<GatewayTargets> {
+  if (flags.config !== undefined) {
+    if (agents.length > 0) {
+      throw new InvalidArgumentError("Use either positional agents or --config, not both");
+    }
+    const parsed = await loadGatewayConfigFile(flags.config);
+    return {
+      specs: parsed.agents,
+      defaultAgent: parsed.defaultAgent,
+      ...(parsed.fallbacks ? { fallbacks: parsed.fallbacks } : {}),
+    };
+  }
+  if (agents.length === 0) {
+    const selection = resolveGatewayAgentsFromConfig(config);
+    return {
+      specs: selection.agents,
+      defaultAgent: selection.defaultAgent,
+      ...(selection.gatewayEnabledModels
+        ? { gatewayEnabledModels: selection.gatewayEnabledModels }
+        : {}),
+      ...(selection.fallbacks ? { fallbacks: selection.fallbacks } : {}),
+    };
+  }
+  return { specs: agents.map((name) => resolveGatewayAgent(name, config)) };
+}
+
+function resolveHandoffFlags(flags: GatewayFlags): {
+  handoff?: { recentTurns: number; maxChars: number };
+} {
+  if (flags.handoff !== true) {
+    return {};
+  }
+  return {
+    handoff: {
+      recentTurns: flags.handoffTurns ?? DEFAULT_HANDOFF_TURNS,
+      maxChars: flags.handoffMaxChars ?? DEFAULT_HANDOFF_MAX_CHARS,
+    },
   };
 }
 
@@ -354,38 +451,54 @@ export function registerGatewayCommand(program: Command, config: ResolvedAcpxCon
     )
     .option("--cwd <dir>", "Working directory for agent processes", process.cwd())
     .option("--verbose", "Log gateway lifecycle events to stderr")
+    .option(
+      "--handoff",
+      "Migrate the conversation to another backend when a bound session selects its model",
+    )
+    .option(
+      "--handoff-turns <count>",
+      "Recent user turns included in the handoff prompt",
+      parsePositiveInteger("--handoff-turns"),
+      DEFAULT_HANDOFF_TURNS,
+    )
+    .option(
+      "--handoff-max-chars <count>",
+      "Maximum size of the handoff prompt",
+      parsePositiveInteger("--handoff-max-chars"),
+      DEFAULT_HANDOFF_MAX_CHARS,
+    )
+    .option(
+      "--health-check-interval <minutes>",
+      "Minutes between backend health checks",
+      parsePositiveInteger("--health-check-interval"),
+      DEFAULT_HEALTH_CHECK_INTERVAL_MINUTES,
+    )
+    .option(
+      "--health-check-probe <mode>",
+      "How a recovered backend is verified: optimistic restores without a request, canary sends one",
+      parseRestoreMode,
+      "optimistic",
+    )
     .option("--approve-all", "Auto-approve all permission requests")
     .option("--approve-reads", "Auto-approve read/search requests and prompt for writes")
     .option("--deny-all", "Deny all permission requests")
     .action(async function (this: Command, agents: string[], flags: GatewayFlags) {
-      if (flags.config !== undefined && agents.length > 0) {
-        throw new InvalidArgumentError("Use either positional agents or --config, not both");
-      }
-
-      let specs: GatewayAgentSpec[];
-      let defaultAgent: string | undefined;
-      let gatewayEnabledModels: string[] | undefined;
-      if (flags.config !== undefined) {
-        const parsed = await loadGatewayConfigFile(flags.config);
-        specs = parsed.agents;
-        defaultAgent = parsed.defaultAgent;
-      } else if (agents.length === 0) {
-        const selection = resolveGatewayAgentsFromConfig(config);
-        specs = selection.agents;
-        defaultAgent = selection.defaultAgent;
-        gatewayEnabledModels = selection.gatewayEnabledModels;
-      } else {
-        specs = agents.map((name) => resolveGatewayAgent(name, config));
-      }
-
-      const permissionMode = resolvePermissionMode(flags, config.defaultPermissions);
+      const targets = await resolveGatewayTargets(flags, agents, config);
       const { runAcpGateway } = await import("../acp/gateway.js");
       process.exitCode = await runAcpGateway({
-        agents: specs,
-        ...(defaultAgent !== undefined ? { defaultAgent } : {}),
-        ...(gatewayEnabledModels !== undefined ? { enabledModels: gatewayEnabledModels } : {}),
+        agents: targets.specs,
+        ...(targets.defaultAgent !== undefined ? { defaultAgent: targets.defaultAgent } : {}),
+        ...(targets.gatewayEnabledModels !== undefined
+          ? { enabledModels: targets.gatewayEnabledModels }
+          : {}),
+        ...(targets.fallbacks !== undefined ? { fallbacks: targets.fallbacks } : {}),
+        ...(flags.healthCheckInterval !== undefined
+          ? { healthCheckIntervalMs: flags.healthCheckInterval * 60_000 }
+          : {}),
+        ...(flags.healthCheckProbe !== undefined ? { restoreMode: flags.healthCheckProbe } : {}),
+        ...resolveHandoffFlags(flags),
         cwd: path.resolve(flags.cwd ?? process.cwd()),
-        permissionMode,
+        permissionMode: resolvePermissionMode(flags, config.defaultPermissions),
         verbose: flags.verbose === true,
       });
     });

@@ -8,6 +8,7 @@ import type {
   ToolCallStatus,
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
+import { matchesRateLimitMessage } from "../../acp/failure-classification.js";
 import {
   extractSessionUpdateNotification,
   parseJsonRpcErrorMessage,
@@ -350,7 +351,7 @@ const TEXT_ERROR_HINT_RULES: TextErrorHintRule[] = [
     ],
   },
   {
-    matches: (params, lowerMessage) => isRateLimitError(params.message, lowerMessage),
+    matches: (params) => isRateLimitError(params.message),
     hints: [
       "hint: the provider appears rate-limited; retry later, switch model, or check provider quota/billing.",
     ],
@@ -404,11 +405,8 @@ function isSessionLoadError(lowerMessage: string): boolean {
   );
 }
 
-function isRateLimitError(message: string, lowerMessage: string): boolean {
-  return (
-    /\b429\b/u.test(message) ||
-    ["rate limit", "quota exceeded"].some((text) => lowerMessage.includes(text))
-  );
+function isRateLimitError(message: string): boolean {
+  return matchesRateLimitMessage(message);
 }
 
 function isModelLookupError(lowerMessage: string): boolean {

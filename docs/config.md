@@ -53,6 +53,10 @@ created `.acpx` directory uses `0700`. Existing config files are never replaced.
   "agents": {
     "my-custom": { "argv": ["./bin/my-acp-server", "acp"] }
   },
+  "fallbacks": [
+    { "agent": "my-custom", "model": "model-1", "priority": 100 },
+    { "agent": "other-custom", "priority": 50 }
+  ],
   "auth": {
     "openai_api_key": "sk-…"
   }
@@ -70,6 +74,7 @@ created `.acpx` directory uses `0700`. Existing config files are never replaced.
 | `format`                    | enum             | `"text"`          | Default `--format`.                                                                                |
 | `mcpServers`                | array            | `[]`              | MCP servers sent to new and loaded ACP sessions. Project values replace global values.             |
 | `agents`                    | object           | `{}`              | Override or add agent commands (see below).                                                        |
+| `fallbacks`                 | array            | `[]`              | Priority-ordered failover chain for `acpx gateway` (see below).                                    |
 | `auth`                      | object           | `{}`              | ACP auth-method credential map (see below).                                                        |
 
 CLI flags always override these values. For example, `--approve-all` wins over `defaultPermissions: "deny-all"`.
@@ -127,6 +132,33 @@ Project config can shadow global config by re-declaring the same key:
 ```
 
 Use this to point a particular repo at a vendored or pinned adapter.
+
+## The `fallbacks` chain
+
+`fallbacks` is an optional priority-ordered list of backends that
+[`acpx gateway`](gateway.md#fallback-chain) may move a session to when the
+current backend stops serving (crash, exhausted quota, or authentication
+refusal):
+
+```json
+{
+  "fallbacks": [
+    { "agent": "codex", "model": "gpt-5.4", "priority": 100 },
+    { "agent": "claude", "model": "claude-sonnet-4-5" },
+    { "agent": "qoder", "priority": 10 }
+  ]
+}
+```
+
+- `agent` is required and must be an agent the gateway serves.
+- `model` is optional; without it the target keeps the model its backend
+  currently serves.
+- `priority` is optional. An entry without one slots in just below the previous
+  entry, so the chain reads top to bottom by default and pinned entries keep
+  their place.
+
+A project `fallbacks` array replaces the global one — the two are not merged
+entry by entry. Without a chain the gateway behaves exactly as before.
 
 ## Authentication
 

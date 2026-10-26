@@ -53,7 +53,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function isAuthRequiredMessage(value: string | undefined): boolean {
+export function isAuthRequiredMessage(value: string | undefined): boolean {
   if (!value) {
     return false;
   }
@@ -69,7 +69,7 @@ function isAuthRequiredMessage(value: string | undefined): boolean {
   ].some((needle) => normalized.includes(needle));
 }
 
-function isAcpAuthRequiredPayload(acp: OutputErrorAcpPayload | undefined): boolean {
+export function isAcpAuthRequiredPayload(acp: OutputErrorAcpPayload | undefined): boolean {
   if (!acp) {
     return false;
   }

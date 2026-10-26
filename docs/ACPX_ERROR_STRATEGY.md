@@ -93,6 +93,33 @@ Agent-spawn policy:
 - describe the missing launch path without assuming it is always the command binary; the executable, interpreter, or working directory may be absent
 - leave non-`ENOENT` spawn failures on the generic runtime path
 
+## Gateway failure classes
+
+`acpx gateway` classifies a failing backend before deciding whether a session
+may move elsewhere (`src/acp/failure-classification.ts`):
+
+| Class         | `detailCode`         | Meaning                                                          |
+| ------------- | -------------------- | ---------------------------------------------------------------- |
+| `crash`       | `AGENT_DISCONNECTED` | the agent process exited or could not start                      |
+| `quota`       | `QUOTA_EXHAUSTED`    | the adapter reported a rate limit, exhausted quota, or no credit |
+| `auth`        | `AUTH_REQUIRED`      | the adapter refused the request because it is not authenticated  |
+| `unavailable` | `NO_SESSION`         | the backend no longer knows the session                          |
+| `unknown`     | —                    | everything else; the session stays on the current backend        |
+
+Policy:
+
+- keep the classification out of the top-level `code` enum; the classes are a
+  routing decision, not a new machine contract
+- `quota` and `auth` reuse the existing `detailCode` vocabulary
+  (`QUOTA_EXHAUSTED`, `AUTH_REQUIRED`) so an orchestrator can match on them
+- structured signals come first: process exits, ACP error codes (`-32000` for
+  auth), and `detailCode`
+- ACP standardizes no quota code, so the `quota` class is the one place where
+  provider wording is read. The patterns live in a single auditable table
+  (`QUOTA_MESSAGE_PATTERNS` plus a `429` check) and are only consulted for
+  this class. An adapter that reports a structured `detailCode` is matched
+  without touching the text
+
 ## Queue detail codes (initial set)
 
 - `QUEUE_OWNER_CLOSED`
