@@ -68,6 +68,8 @@ export type DiagnosticsRunnerOptions = {
 
 const INIT_TIMEOUT_MS = 60_000;
 const PING_TIMEOUT_MS = 120_000;
+const GATEWAY_DISCOVERY_TIMEOUT_MS = 10_000;
+const DISCOVERY_POLL_INTERVAL_MS = 100;
 const DIAGNOSTIC_CONCURRENCY = 3;
 const REPLY_PREVIEW_LIMIT = 200;
 
@@ -153,6 +155,30 @@ export class DiagnosticsRunner {
     });
   }
 
+  /**
+   * Reads the session's models, waiting up to `discoveryBudgetMs` when the
+   * agent is a gateway: it answers `session/new` before its backends finish
+   * probing and pushes the merged model list once they do.
+   */
+  private async readModelNames(
+    runtime: AcpRuntime,
+    handle: Parameters<AcpRuntime["close"]>[0]["handle"],
+    discoveryBudgetMs: number,
+  ): Promise<string[]> {
+    const deadline = Date.now() + discoveryBudgetMs;
+    for (;;) {
+      const status = (await runtime.getStatus?.({ handle })) ?? undefined;
+      const models = status?.models;
+      const names = models
+        ? (models.availableModels?.map((model) => model.name) ?? [...models.availableModelIds])
+        : [];
+      if (names.length > 0 || Date.now() >= deadline) {
+        return names;
+      }
+      await new Promise((resolve) => setTimeout(resolve, DISCOVERY_POLL_INTERVAL_MS));
+    }
+  }
+
   private runtimeFor(): AcpRuntime {
     if (!this.runtime) {
       this.runtime = createAcpRuntime({
@@ -194,22 +220,24 @@ export class DiagnosticsRunner {
       return;
     }
 
+    const backendNames = await detectGatewayBackendNames(agent.argv, this.options.cwd);
+    const isGateway = backendNames !== undefined;
+
     agent.models.status = "running";
     try {
-      const status = (await runtime.getStatus?.({ handle })) ?? undefined;
-      const models = status?.models;
-      const names = models
-        ? (models.availableModels?.map((model) => model.name) ?? [...models.availableModelIds])
-        : [];
-      agent.models = { status: "ok", names: [...names] };
+      const names = await this.readModelNames(
+        runtime,
+        handle,
+        isGateway ? GATEWAY_DISCOVERY_TIMEOUT_MS : 0,
+      );
+      agent.models = { status: "ok", names };
     } catch (error) {
       agent.models = { status: "failed", names: [], error: errorMessage(error) };
     }
 
     // Gateway expansion: when the agent is an acpx gateway, enumerate every
     // backend agent's models through it via session/new _meta routing.
-    const backendNames = await detectGatewayBackendNames(agent.argv, this.options.cwd);
-    if (backendNames !== undefined) {
+    if (isGateway) {
       agent.isGateway = true;
       agent.backends = backendNames.map((name) => ({ name, status: "pending", names: [] }));
       const gateway = this.runtimeFor();

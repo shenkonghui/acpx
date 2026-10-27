@@ -21,6 +21,7 @@ import {
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionConfigOption,
+  type SessionModeState,
   type SessionNotification,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
@@ -152,6 +153,10 @@ type GatewaySession = {
   migrating?: boolean;
   /** Number of prompts currently running on the bound backend. */
   pendingPrompts: number;
+  /** Prompts already written to the bound backend; lags pendingPrompts while binding. */
+  promptsForwarded: number;
+  /** Cancels that arrived while a prompt was still waiting to reach its backend. */
+  pendingCancels: number;
   /** Structured conversation summary used to migrate to another backend. */
   history: HandoffHistory;
   /** Unified permission currently exposed to the client. */
@@ -160,6 +165,8 @@ type GatewaySession = {
   backendConfigOptions?: SessionConfigOption[];
   /** Latest model state reported by the bound backend. */
   backendModels?: SessionModelState;
+  /** Mode support advertised by the bound backend's own session. */
+  backendModeSupport?: BackendModeSupport;
   /** Unified permission set before binding, replayed once bound. */
   bufferedMode?: UnifiedPermission;
   /** Other config options set before binding, replayed once bound. */
@@ -203,6 +210,16 @@ function filterModelState(
   return { ...models, currentModelId, availableModels };
 }
 
+/**
+ * Startup rendezvous supplied by the launcher. Backends are started in the
+ * background so the gateway can serve ACP immediately; anything that needs a
+ * backend process (binding, migration) waits here first.
+ */
+export type GatewayBackendReadiness = {
+  /** Resolves once the backend process is ready; rejects when it cannot start. */
+  waitForStart(agentName: string): Promise<void>;
+};
+
 export type AcpGatewayOptions = {
   agents: Array<{ name: string; client: AcpClient; enabledModels?: ReadonlySet<string> }>;
   defaultAgentName: string;
@@ -213,6 +230,8 @@ export type AcpGatewayOptions = {
   handoff?: Required<GatewayHandoffOptions>;
   /** Failover chain; absent keeps every failure on the current backend. */
   failover?: FailoverController;
+  /** Backend startup rendezvous used before a session binds; absent means already started. */
+  readiness?: GatewayBackendReadiness;
 };
 
 export class AcpGateway implements Agent {
@@ -225,6 +244,7 @@ export class AcpGateway implements Agent {
   /** Handoff settings used by internal migrations; set whenever failover can move a session. */
   private readonly migrationHandoff?: Required<GatewayHandoffOptions>;
   private readonly failover?: FailoverController;
+  private readonly readiness?: GatewayBackendReadiness;
   private readonly log: (message: string) => void;
   private connection?: AgentConnection;
 
@@ -248,6 +268,7 @@ export class AcpGateway implements Agent {
     this.mergedAllowlist = enabledModels;
     this.handoff = options.handoff;
     this.failover = options.failover;
+    this.readiness = options.readiness;
     this.migrationHandoff =
       this.handoff ??
       (this.failover
@@ -268,9 +289,54 @@ export class AcpGateway implements Agent {
     return this.sessions.size;
   }
 
-  /** Records the result of probing a backend (see runAcpGateway). */
-  setBackendDiscovery(agentName: string, discovery: BackendDiscovery): void {
+  /**
+   * Records the result of probing a backend and re-publishes the merged model
+   * surface, so sessions opened before the probe finished learn the models.
+   */
+  async setBackendDiscovery(agentName: string, discovery: BackendDiscovery): Promise<void> {
     this.requireClient(agentName).discovery = discovery;
+    await this.publishSurface();
+  }
+
+  /** Pushes the current config-option surface to every session it applies to. */
+  private async publishSurface(): Promise<void> {
+    const connection = this.connection;
+    if (!connection) {
+      return;
+    }
+    for (const session of this.sessions.values()) {
+      const unbound = !session.state;
+      if (!unbound && !this.handoff) {
+        continue;
+      }
+      if (unbound) {
+        this.adoptDefaultPermission(session);
+      }
+      await connection.sessionUpdate({
+        sessionId: session.gatewaySessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: unbound
+            ? this.preBindConfigOptions(session)
+            : this.boundConfigOptions(session),
+        },
+      });
+    }
+  }
+
+  /**
+   * Mirrors the default backend's current permission on unbound sessions, the
+   * way `session/new` did before discovery became lazy. A permission the client
+   * already picked pre-bind wins.
+   */
+  private adoptDefaultPermission(session: GatewaySession): void {
+    if (session.bufferedMode !== undefined) {
+      return;
+    }
+    const discovery = this.clients.get(this.resolveDefaultAgent())?.discovery;
+    if (discovery) {
+      session.unifiedPermission = resolveUnifiedCurrentPermission(discovery.mode);
+    }
   }
 
   private requireClient(agentName: string): GatewayClientState {
@@ -349,7 +415,7 @@ export class AcpGateway implements Agent {
       return update;
     }
     if (record.sessionUpdate === "current_mode_update") {
-      return this.translateModeUpdate(state, session, record, update);
+      return this.translateModeUpdate(session, record, update);
     }
     if (record.sessionUpdate === "config_option_update" && Array.isArray(record.configOptions)) {
       return this.translateConfigOptionUpdate(state, session, record);
@@ -357,17 +423,22 @@ export class AcpGateway implements Agent {
     return update;
   }
 
+  /** Mode support for the session's backend: its bound session first, then discovery. */
+  private sessionModeSupport(session: GatewaySession): BackendModeSupport | undefined {
+    return session.backendModeSupport ?? session.state?.discovery?.mode;
+  }
+
   private translateModeUpdate(
-    state: GatewayClientState,
     session: GatewaySession,
     record: Record<string, unknown>,
     update: SessionNotification["update"],
   ): SessionNotification["update"] {
     const backendModeId =
       typeof record.currentModeId === "string" ? record.currentModeId : undefined;
+    const support = this.sessionModeSupport(session);
     const unified =
-      backendModeId && state.discovery
-        ? toUnifiedPermission(backendModeId, state.discovery.mode.advertisedIds)
+      backendModeId && support
+        ? toUnifiedPermission(backendModeId, support.advertisedIds)
         : undefined;
     if (!unified) {
       return update;
@@ -421,6 +492,8 @@ export class AcpGateway implements Agent {
       cwd: params.cwd,
       unifiedPermission: DEFAULT_UNIFIED_PERMISSION,
       pendingPrompts: 0,
+      promptsForwarded: 0,
+      pendingCancels: 0,
       history: createHandoffHistory(),
       bufferedConfigOptions: [],
       relayedUpdates: 0,
@@ -491,8 +564,17 @@ export class AcpGateway implements Agent {
         await this.replayBuffered(session);
       }
       const relayedBefore = session.relayedUpdates;
+      const state = session.state!;
+      const downstreamSessionId = session.downstreamSessionId!;
       try {
-        return await session.state!.client.prompt(session.downstreamSessionId!, params.prompt);
+        const response = state.client.prompt(downstreamSessionId, params.prompt);
+        session.promptsForwarded += 1;
+        try {
+          await this.flushPendingCancels(session, state, downstreamSessionId);
+          return await response;
+        } finally {
+          session.promptsForwarded -= 1;
+        }
       } catch (error) {
         return await this.recoverFromPromptFailure(session, error, params.prompt, {
           relayedBefore,
@@ -501,6 +583,28 @@ export class AcpGateway implements Agent {
       }
     } finally {
       session.pendingPrompts -= 1;
+      if (session.pendingPrompts === 0) {
+        session.pendingCancels = 0;
+      }
+    }
+  }
+
+  /**
+   * Sends cancels that arrived while the turn was still binding. They are
+   * written after the prompt so the backend already owns the turn.
+   */
+  private async flushPendingCancels(
+    session: GatewaySession,
+    state: GatewayClientState,
+    downstreamSessionId: string,
+  ): Promise<void> {
+    while (session.pendingCancels > 0) {
+      session.pendingCancels -= 1;
+      try {
+        await state.client.cancel(downstreamSessionId);
+      } catch {
+        // A dead backend surfaces through the prompt result; the cancel is moot.
+      }
     }
   }
 
@@ -568,6 +672,11 @@ export class AcpGateway implements Agent {
 
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.requireSession(params.sessionId);
+    if (session.pendingPrompts > session.promptsForwarded) {
+      // The turn is still binding; hand the cancel to it instead of dropping it.
+      session.pendingCancels += 1;
+      return;
+    }
     if (!session.state || !session.downstreamSessionId) {
       return;
     }
@@ -636,18 +745,42 @@ export class AcpGateway implements Agent {
     cwd: string,
   ): Promise<void> {
     const state = this.requireClient(agentName);
+    await this.readiness?.waitForStart(agentName);
     const created = await state.client.createSession(cwd);
+    this.applyCreatedSession(session, state, created);
+    this.log(`bound session ${session.gatewaySessionId} to agent ${agentName}`);
+  }
+
+  /** Publishes a freshly created downstream session on the gateway session. */
+  private applyCreatedSession(
+    session: GatewaySession,
+    state: GatewayClientState,
+    created: SessionCreateResult,
+  ): void {
     session.state = state;
     session.downstreamSessionId = created.sessionId;
     session.backendConfigOptions = created.configOptions ?? state.discovery?.configOptions ?? [];
     session.backendModels = created.models
       ? filterModelState(created.models, state.enabledModels)
       : state.discovery?.models;
-    if (state.discovery) {
-      session.unifiedPermission = resolveUnifiedCurrentPermission(state.discovery.mode);
-    }
+    session.backendModeSupport = this.createdModeSupport(state, created);
+    session.unifiedPermission = resolveUnifiedCurrentPermission(session.backendModeSupport);
     state.sessionRoutes.set(created.sessionId, session.gatewaySessionId);
-    this.log(`bound session ${session.gatewaySessionId} to agent ${agentName}`);
+  }
+
+  /**
+   * Mode support the backend's own session advertised, falling back to
+   * discovery when the session reported no usable mode surface.
+   */
+  private createdModeSupport(
+    state: GatewayClientState,
+    created: SessionCreateResult,
+  ): BackendModeSupport {
+    const modeSupport = resolveBackendModeSupport({
+      configOptions: created.configOptions,
+      modes: created.modes,
+    });
+    return modeSupport.setPath === "none" ? (state.discovery?.mode ?? modeSupport) : modeSupport;
   }
 
   private async applyModelSelection(
@@ -758,6 +891,7 @@ export class AcpGateway implements Agent {
         sourceSessionId,
         target,
         createdSessionId: created.sessionId,
+        ...(created.modes ? { createdModes: created.modes } : {}),
         modelId,
         applied,
       });
@@ -779,6 +913,7 @@ export class AcpGateway implements Agent {
     agentName: string,
   ): Promise<SessionCreateResult> {
     try {
+      await this.readiness?.waitForStart(agentName);
       return await target.client.createSession(session.cwd);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -877,6 +1012,7 @@ export class AcpGateway implements Agent {
       sourceSessionId: string;
       target: GatewayClientState;
       createdSessionId: string;
+      createdModes?: SessionModeState;
       modelId: string | undefined;
       applied: {
         models?: SessionModelState;
@@ -892,7 +1028,23 @@ export class AcpGateway implements Agent {
     const configOptions = this.migratedConfigOptions(target, applied);
     session.backendConfigOptions = configOptions;
     session.backendModels = this.migratedModels(target, applied, configOptions, modelId);
+    session.backendModeSupport = this.migratedModeSupport(target, applied, input.createdModes);
     appendNote(session.history, `Session migrated from "${source.name}" to "${target.name}".`);
+  }
+
+  private migratedModeSupport(
+    target: GatewayClientState,
+    applied: { createdConfigOptions?: SessionConfigOption[] },
+    createdModes: SessionModeState | undefined,
+  ): BackendModeSupport | undefined {
+    const advertised = resolveBackendModeSupport({
+      configOptions: applied.createdConfigOptions,
+      modes: createdModes,
+    });
+    if (advertised.setPath !== "none") {
+      return advertised;
+    }
+    return target.discovery?.mode ?? advertised;
   }
 
   private migratedConfigOptions(
@@ -1087,7 +1239,7 @@ export class AcpGateway implements Agent {
     value: UnifiedPermission,
   ): Promise<void> {
     const state = session.state!;
-    const support = state.discovery?.mode;
+    const support = this.sessionModeSupport(session);
     const backendModeId = support ? toBackendModeId(value, support.advertisedIds) : undefined;
     if (!support || support.setPath === "none" || !backendModeId) {
       return;
@@ -1322,16 +1474,52 @@ function dedupeAgents(agents: GatewayAgentSpec[]): GatewayAgentSpec[] {
   return unique;
 }
 
-async function startAgents(
+type BackendReadiness = GatewayBackendReadiness & {
+  /** Starts and probes every backend; resolves once all pipelines settled. */
+  begin(): Promise<void>;
+};
+
+/**
+ * Starts and probes every backend in parallel.
+ *
+ * Nothing waits for the slowest agent: the gateway serves ACP while this runs
+ * in the background and publishes each backend's models as soon as its probe
+ * lands. A backend that cannot start is logged and skipped, like a failed
+ * probe; binding to it surfaces the launch error.
+ */
+function createBackendReadiness(
   states: GatewayClientState[],
-  started: GatewayClientState[],
+  getGateway: () => AcpGateway | undefined,
+  cwd: string,
   log: (message: string) => void,
-): Promise<void> {
-  for (const state of states) {
-    await state.client.start();
-    started.push(state);
-    log(`started agent: ${state.name}`);
-  }
+): BackendReadiness {
+  const starts = new Map<string, Promise<void>>();
+  return {
+    waitForStart: async (agentName: string): Promise<void> => {
+      await starts.get(agentName);
+    },
+    begin: async (): Promise<void> => {
+      const pipelines = states.map((state) => {
+        const started = state.client.start();
+        starts.set(state.name, started);
+        return started.then(
+          async () => {
+            log(`started agent: ${state.name}`);
+            const discovery = await probeBackendQuietly(state, cwd, log);
+            await getGateway()
+              ?.setBackendDiscovery(state.name, discovery)
+              .catch((error: unknown) => {
+                log(`could not publish ${state.name} discovery: ${String(error)}`);
+              });
+          },
+          (error: unknown) => {
+            log(`agent ${state.name} failed to start: ${String(error)}`);
+          },
+        );
+      });
+      await Promise.all(pipelines);
+    },
+  };
 }
 
 /**
@@ -1355,32 +1543,27 @@ async function probeBackend(state: GatewayClientState, cwd: string): Promise<Bac
 }
 
 /**
- * Probes each backend once to learn its models and modes.
- *
  * A backend whose probe fails (for example an agent that needs auth before
  * `session/new`) is degraded rather than fatal: it is kept reachable via
  * `_meta.acpx.agent`, but contributes no models or modes to the merged surface.
  */
-async function probeBackends(
-  states: GatewayClientState[],
-  gateway: AcpGateway,
+async function probeBackendQuietly(
+  state: GatewayClientState,
   cwd: string,
   log: (message: string) => void,
-): Promise<void> {
-  for (const state of states) {
-    let discovery: BackendDiscovery;
-    try {
-      discovery = await probeBackend(state, cwd);
-    } catch (error) {
-      discovery = { configOptions: [], mode: { setPath: "none", advertisedIds: [] } };
-      log(`probe failed for agent ${state.name}: ${String(error)} (no models advertised)`);
-    }
-    state.discovery = discovery;
-    gateway.setBackendDiscovery(state.name, discovery);
-    log(
-      `probed agent ${state.name}: models=${discovery.models?.availableModels.length ?? 0} modes=${discovery.mode.advertisedIds.length} (${discovery.mode.setPath})`,
-    );
+): Promise<BackendDiscovery> {
+  let discovery: BackendDiscovery;
+  try {
+    discovery = await probeBackend(state, cwd);
+  } catch (error) {
+    discovery = { configOptions: [], mode: { setPath: "none", advertisedIds: [] } };
+    log(`probe failed for agent ${state.name}: ${String(error)} (no models advertised)`);
+    return discovery;
   }
+  log(
+    `probed agent ${state.name}: models=${discovery.models?.availableModels.length ?? 0} modes=${discovery.mode.advertisedIds.length} (${discovery.mode.setPath})`,
+  );
+  return discovery;
 }
 
 function createGatewayLogger(verbose: boolean | undefined): (message: string) => void {
@@ -1435,6 +1618,7 @@ function buildGateway(
   enabledModels: ReadonlySet<string> | undefined,
   handoff: Required<GatewayHandoffOptions> | undefined,
   failover: FailoverController | undefined,
+  readiness: GatewayBackendReadiness,
 ): AcpGateway {
   return new AcpGateway({
     agents: states.map((state) => ({
@@ -1447,6 +1631,7 @@ function buildGateway(
     ...(enabledModels ? { enabledModels } : {}),
     ...(handoff ? { handoff } : {}),
     ...(failover ? { failover } : {}),
+    readiness,
   });
 }
 
@@ -1496,7 +1681,7 @@ function createFailoverController(input: {
           await state.client.start();
           const discovery = await probeBackend(state, cwd);
           state.discovery = discovery;
-          getGateway()?.setBackendDiscovery(agent, discovery);
+          await getGateway()?.setBackendDiscovery(agent, discovery);
           log(`respawned agent ${agent}`);
           return true;
         } catch (error) {
@@ -1581,6 +1766,7 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
     ...(options.restoreMode !== undefined ? { restoreMode: options.restoreMode } : {}),
   });
   failoverRef = failover;
+  const readiness = createBackendReadiness(states, () => gatewayRef, options.cwd, log);
   const gateway = buildGateway(
     states,
     options,
@@ -1588,18 +1774,18 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
     enabledModels,
     resolveHandoffOptions(options.handoff),
     failover,
+    readiness,
   );
   gatewayRef = gateway;
+  const startup = readiness.begin();
 
-  const started: GatewayClientState[] = [];
-  try {
-    await startAgents(states, started, log);
-    await probeBackends(states, gateway, options.cwd, log);
-  } catch (error) {
-    await Promise.allSettled(started.map((state) => state.client.close()));
-    throw error;
-  }
-  failover?.start();
+  // Backends boot and probe in the background: the gateway answers ACP right
+  // away and pushes the merged model list when each discovery lands.
+  void startup.then(() => {
+    if (!closing) {
+      failover?.start();
+    }
+  });
 
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = (): Promise<void> => {
@@ -1608,6 +1794,7 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
       failover?.stop();
       log("shutting down; retiring all agents");
       await Promise.allSettled(states.map((state) => state.client.close()));
+      await startup;
     })();
     return shutdownPromise;
   };

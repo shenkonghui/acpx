@@ -49,6 +49,9 @@ const promptLog = argValue('--prompt-log');
 const failNewSession = args.includes('--fail-new-session');
 const failPrompt = argValue('--fail-prompt');
 const failPromptText = argValue('--fail-prompt-text');
+const initDelay = Number(argValue('--init-delay') ?? 0);
+const newSessionDelay = Number(argValue('--new-session-delay') ?? 0);
+const sleep = (ms) => (ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve());
 
 const QUOTA_ERROR = { code: -32000, message: 'Quota exceeded for this account' };
 
@@ -81,16 +84,18 @@ function sessionResponse(sessionId) {
   return result;
 }
 
-readline.createInterface({ input: process.stdin }).on('line', (line) => {
+readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   const message = JSON.parse(line);
   const method = message.method;
   const params = message.params ?? {};
 
   if (method === 'initialize') {
+    await sleep(initDelay);
     send({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1, agentCapabilities: {} } });
     return;
   }
   if (method === 'session/new') {
+    await sleep(newSessionDelay);
     if (failNewSession) {
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'Authentication required: Authentication is required.' } });
       return;
@@ -212,6 +217,53 @@ class GatewayTestClient implements Client {
 
   async sessionUpdate(params: SessionNotification): Promise<void> {
     this.updates.push(params);
+  }
+
+  /** Latest config options pushed for `sessionId`, if any. */
+  latestConfigOptions(sessionId: string): SessionConfigOption[] | undefined {
+    let latest: SessionConfigOption[] | undefined;
+    for (const update of this.updates) {
+      if (update.sessionId !== sessionId) {
+        continue;
+      }
+      const record = update.update as {
+        sessionUpdate?: string;
+        configOptions?: SessionConfigOption[];
+      };
+      if (record.sessionUpdate === "config_option_update" && record.configOptions) {
+        latest = record.configOptions;
+      }
+    }
+    return latest;
+  }
+
+  /**
+   * Waits for a pushed surface that advertises every model in `expected`.
+   * Backends publish their discovery independently, so a single push can carry
+   * a partial merged surface and the full one may land several pushes later.
+   */
+  async waitForModels(
+    sessionId: string,
+    expected: string[],
+    timeoutMs = 10_000,
+  ): Promise<SessionConfigOption[]> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const latest = this.latestConfigOptions(sessionId);
+      if (latest) {
+        const values = selectValues(findOption(latest, "model"));
+        if (expected.every((model) => values.includes(model))) {
+          return latest;
+        }
+      }
+      if (Date.now() > deadline) {
+        const seen = selectValues(findOption(this.latestConfigOptions(sessionId), "model"));
+        throw new Error(
+          `no config_option_update for ${sessionId} advertising ${expected.join(", ")} within ${timeoutMs}ms (last: ${seen.join(", ")})`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
 
   async requestPermission(params: {
@@ -342,6 +394,43 @@ async function initializeGateway(harness: GatewayHarness): Promise<InitializeRes
   });
 }
 
+/**
+ * Opens a session and returns the config options a client would end up with.
+ *
+ * Backends boot and probe in the background, so `session/new` may answer before
+ * the merged model surface exists; the gateway then pushes it. This mirrors what
+ * a real client does and keeps assertions on `configOptions` meaningful.
+ */
+async function openSession(
+  harness: GatewayHarness,
+  params: { cwd: string; mcpServers: []; _meta?: Record<string, unknown> },
+  expectedModels: string[],
+): Promise<{ sessionId: string; configOptions?: SessionConfigOption[] | null }> {
+  const session = await harness.connection.newSession(params);
+  const hasAll = (options: SessionConfigOption[] | null | undefined): boolean => {
+    const values = selectValues(findOption(options, "model"));
+    return expectedModels.every((model) => values.includes(model));
+  };
+  if (hasAll(session.configOptions)) {
+    return session;
+  }
+  return {
+    sessionId: session.sessionId,
+    configOptions: await harness.client.waitForModels(session.sessionId, expectedModels),
+  };
+}
+
+/** Polls `check` until it returns true; rejects after `timeoutMs`. */
+async function pollUntil(check: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-gateway-unified-"));
   const previousHome = process.env.HOME;
@@ -452,10 +541,15 @@ async function withGateway(
 test("gateway: session/new exposes merged prefixed models and unified mode", async () => {
   await withGateway(async (harness, cwd) => {
     await initializeGateway(harness);
-    const session = await harness.connection.newSession({ cwd, mcpServers: [] });
-
-    const modelValues = selectValues(findOption(session.configOptions, "model")).toSorted();
-    assert.deepEqual(modelValues, [
+    const session = await openSession(harness, { cwd, mcpServers: [] }, [
+      "alpha/alpha-1",
+      "alpha/alpha-2",
+      "beta/beta-1",
+      "gamma/gamma-1",
+      "gamma/gamma-2",
+      "gamma/gamma-3",
+    ]);
+    assert.deepEqual(selectValues(findOption(session.configOptions, "model")).toSorted(), [
       "alpha/alpha-1",
       "alpha/alpha-2",
       "beta/beta-1",
@@ -789,7 +883,13 @@ test("gateway: enabledModels filters backend models on the merged and bound surf
   await withGateway(
     async (harness, cwd) => {
       await initializeGateway(harness);
-      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+      const session = await openSession(harness, { cwd, mcpServers: [] }, [
+        "alpha/alpha-2",
+        "beta/beta-1",
+        "gamma/gamma-1",
+        "gamma/gamma-2",
+        "gamma/gamma-3",
+      ]);
 
       // Merged surface: alpha is restricted to alpha-2, beta and gamma are untouched.
       assert.deepEqual(selectValues(findOption(session.configOptions, "model")).toSorted(), [
@@ -856,7 +956,7 @@ test("gateway: a backend whose probe fails is degraded, not fatal", async () => 
   await withGateway(
     async (harness, cwd) => {
       await initializeGateway(harness);
-      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+      const session = await openSession(harness, { cwd, mcpServers: [] }, ["healthy/healthy-1"]);
       // The failing backend contributes no models; the healthy one still does.
       assert.deepEqual(selectValues(findOption(session.configOptions, "model")), [
         "healthy/healthy-1",
@@ -888,6 +988,141 @@ test("gateway: a backend whose probe fails is degraded, not fatal", async () => 
         ],
       },
     ],
+  );
+});
+
+test("gateway: session/new answers before the backends finish probing", async () => {
+  await withGateway(
+    async (harness, cwd) => {
+      await initializeGateway(harness);
+
+      const startedAt = Date.now();
+      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+      const elapsed = Date.now() - startedAt;
+
+      // The probe takes 2s per backend; answering must not wait for it.
+      assert.ok(elapsed < 1_000, `session/new took ${elapsed}ms`);
+      assert.equal(findOption(session.configOptions, "model"), undefined);
+
+      // Discovery arrives later as a pushed config_option_update.
+      const pushed = await harness.client.waitForModels(session.sessionId, [
+        "alpha/alpha-1",
+        "alpha/alpha-2",
+        "beta/beta-1",
+      ]);
+      assert.deepEqual(selectValues(findOption(pushed, "model")).toSorted(), [
+        "alpha/alpha-1",
+        "alpha/alpha-2",
+        "beta/beta-1",
+      ]);
+      assert.deepEqual(selectValues(findOption(pushed, "mode")).toSorted(), [
+        "ask",
+        "bypass",
+        "code",
+      ]);
+    },
+    (scriptPath) => [
+      {
+        name: AGENT_ALPHA,
+        argv: [
+          ...agentArgv(
+            scriptPath,
+            AGENT_ALPHA,
+            "alpha-1,alpha-2",
+            "auto,plan,full-access",
+            "config",
+          ),
+          "--new-session-delay",
+          "2000",
+        ],
+        default: true,
+      },
+      {
+        name: AGENT_BETA,
+        argv: [
+          ...agentArgv(scriptPath, AGENT_BETA, "beta-1", "auto,plan,full-access", "config"),
+          "--new-session-delay",
+          "2000",
+        ],
+      },
+    ],
+  );
+});
+
+test("gateway: cancel issued while the first turn binds reaches the backend", async () => {
+  await withGateway(
+    async (harness, cwd) => {
+      await initializeGateway(harness);
+      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+      const prompt = harness.connection.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "hang" }],
+      });
+
+      // The default backend is still initializing, so the cancel lands before
+      // the turn is written downstream; the gateway has to replay it once bound.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await harness.connection.cancel({ sessionId: session.sessionId });
+
+      const result = await prompt;
+      assert.equal(result.stopReason, "cancelled");
+    },
+    (scriptPath) => [
+      {
+        name: AGENT_ALPHA,
+        argv: [
+          ...agentArgv(scriptPath, AGENT_ALPHA, "alpha-1", "auto", "config"),
+          "--init-delay",
+          "1500",
+        ],
+        default: true,
+      },
+    ],
+  );
+});
+
+test("gateway: backends start and probe in parallel", async () => {
+  await withGateway(
+    async (harness) => {
+      await initializeGateway(harness);
+      await pollUntil(
+        () =>
+          harness.stderrText.includes("probed agent fast") &&
+          harness.stderrText.includes("probed agent slow"),
+        15_000,
+        "both backends to finish probing",
+      );
+
+      const log = harness.stderrText;
+      const startedSlow = log.indexOf("started agent: slow");
+      const startedFast = log.indexOf("started agent: fast");
+      const probedSlow = log.indexOf("probed agent slow");
+      const probedFast = log.indexOf("probed agent fast");
+      assert.ok(startedSlow >= 0 && startedFast >= 0, log);
+      assert.ok(probedSlow >= 0 && probedFast >= 0, log);
+      // `slow` is listed first but takes 800ms longer to boot, so a serial
+      // startup/probe loop would finish it long before `fast` appears.
+      assert.ok(startedFast < startedSlow, log);
+      assert.ok(probedFast < probedSlow, log);
+    },
+    (scriptPath) => [
+      {
+        name: "slow",
+        argv: [
+          ...agentArgv(scriptPath, "slow", "slow-1", "auto", "config"),
+          "--init-delay",
+          "800",
+          "--new-session-delay",
+          "300",
+        ],
+      },
+      {
+        name: "fast",
+        argv: agentArgv(scriptPath, "fast", "fast-1", "auto", "config"),
+        default: true,
+      },
+    ],
+    ["--verbose"],
   );
 });
 

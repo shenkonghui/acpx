@@ -15,11 +15,13 @@ Repo: https://github.com/openclaw/acpx
 - Add an `enabledModels` array to `agents.<name>` config entries that whitelists the models an agent may advertise through `acpx gateway`. Per-agent entries filter that backend's models on the merged selector and on bound sessions; an `enabledModels` entry on the gateway's own `acpx-gateway` config agent filters the merged surface across every backend, so upstream clients like Paseo only see the curated subset. Direct `acpx <agent>` calls are unaffected.
 - Add `--handoff` to `acpx gateway`: selecting another backend's model on a bound session migrates the conversation instead of failing. The gateway creates a session on the target agent, sends a structured handoff prompt (latest plan, recent tool paths, last N user turns) whose output is dropped upstream, then switches the route; a failed migration keeps the old binding, and switching mid-turn is rejected. `--handoff-turns` (default 8) and `--handoff-max-chars` (default 8000) tune the prompt. With handoff enabled the merged model selector stays visible after binding so clients can request a switch.
 - Add a `fallbacks` chain to the config (`fallbacks: [{ agent, model?, priority? }]`) that makes `acpx gateway` degrade to the next healthy backend when the current one crashes, runs out of quota, or refuses the request for missing authentication. The chain is priority-ordered, a failing turn is migrated with the handoff mechanism and replayed once on the new backend (never after output was already streamed), and the client receives the updated model. `--health-check-interval <minutes>` (default 60) checks unhealthy backends, respawns crashed ones, and moves sessions back to a recovered higher-priority backend; `--health-check-probe canary` verifies a recovery with a real request instead of trusting it. Without a `fallbacks` chain the gateway behaves exactly as before.
+- Make `acpx gateway` answer ACP immediately: backends start and probe in parallel in the background instead of serially before the server is reachable, and each backend's models and modes arrive as a pushed `config_option_update` on sessions that were opened before its probe landed. Startup latency drops from the sum of every backend's handshake and probe to roughly the slowest one.
 
 ### Fixes
 
 - Windows/authentication: preserve inherited credential values when auth aliases use different environment-variable casing.
 - Replay viewer: let arrow keys select previous and next attempts without snapping back on every key release, and keep playback running when tabbing into the scrubber.
+- Gateway: deliver a `session/cancel` that arrives while the first prompt is still binding to its backend, instead of dropping it and leaving the turn running.
 
 ## 0.19.2 - 2026-09-23
 

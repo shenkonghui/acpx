@@ -95,6 +95,14 @@ const runtimeFactory: ChatRuntimeFactory = (options) =>
     verbose: options.verbose,
   });
 
+/** How long an opened session keeps watching for late gateway model discovery. */
+const MODEL_DISCOVERY_TIMEOUT_MS = 10_000;
+const MODEL_DISCOVERY_POLL_INTERVAL_MS = 250;
+
+function modelCount(models: SessionModels | undefined): number {
+  return models?.availableModels?.length ?? models?.availableModelIds.length ?? 0;
+}
+
 /** Wraps `AcpxRuntime` behind the browser chat protocol (one session per chat id). */
 export class ChatSessionManager {
   /** One runtime per permission mode, created lazily on first use. */
@@ -269,6 +277,9 @@ export class ChatSessionManager {
         session.model = session.models.currentModelId;
       }
       this.sessions.set(chatId, session);
+      if (modelCount(session.models) === 0) {
+        void this.refreshModelsAfterDiscovery(session);
+      }
       return this.describe(session);
     } catch (error) {
       this.emitError(chatId, "session_error", errorMessage(error));
@@ -409,6 +420,31 @@ export class ChatSessionManager {
       delete session.model;
     }
     this.emit({ type: "session_models", chatId: session.chatId, models });
+  }
+
+  /**
+   * Gateway sessions answer before their backends finish probing and push the
+   * merged model list afterwards, so an empty list at open time can still fill
+   * in. Poll for a while and broadcast the models once they land.
+   */
+  private async refreshModelsAfterDiscovery(session: ChatSession): Promise<void> {
+    const deadline = Date.now() + MODEL_DISCOVERY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, MODEL_DISCOVERY_POLL_INTERVAL_MS));
+      if (this.sessions.get(session.chatId) !== session) {
+        return;
+      }
+      const models = await this.readModels(session);
+      if (models === undefined || modelCount(models) === 0) {
+        continue;
+      }
+      session.models = models;
+      if (session.model === undefined && models.currentModelId !== undefined) {
+        session.model = models.currentModelId;
+      }
+      this.emit({ type: "session_models", chatId: session.chatId, models });
+      return;
+    }
   }
 
   async closeSession(chatId: string, discard = false): Promise<void> {

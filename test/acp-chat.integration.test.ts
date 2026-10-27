@@ -1738,6 +1738,20 @@ test("chat WebSocket streams a turn through a real acpx gateway backend", async 
       assert.equal(opened.agent, "gw");
       assert.equal(opened.cwd, dir);
 
+      // Backends probe in the background, so the merged models arrive either
+      // with the session or as a pushed update once discovery lands.
+      const models =
+        (opened.models?.availableModelIds.length ?? 0) > 0
+          ? opened.models
+          : (await client.waitFor("session_models", (message) => message.chatId === "gw1")).models;
+      assert.deepEqual(models?.availableModelIds.toSorted(), [
+        "beta/default-model",
+        "beta/fast-model",
+        "beta/gpt-5.2",
+        "beta/gpt-5.4",
+        "beta/smart-model",
+      ]);
+
       client.send({
         type: "send",
         chatId: "gw1",
