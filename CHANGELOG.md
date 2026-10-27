@@ -22,6 +22,11 @@ Repo: https://github.com/openclaw/acpx
 - Windows/authentication: preserve inherited credential values when auth aliases use different environment-variable casing.
 - Replay viewer: let arrow keys select previous and next attempts without snapping back on every key release, and keep playback running when tabbing into the scrubber.
 - Gateway: deliver a `session/cancel` that arrives while the first prompt is still binding to its backend, instead of dropping it and leaving the turn running.
+- Gateway: persist each backend's probed models and modes in `~/.acpx/gateway-discovery/` and seed them at startup, so a restarted gateway answers `session/new` with the last known surface while slow backends (for example `npx ...@latest`) finish booting.
+- Gateway: bound how long a bind waits for a backend that never answers `initialize` (default 120s, `ACPX_GATEWAY_START_TIMEOUT_MS` overrides) and abandon the launch on expiry instead of hanging the request.
+- Gateway: exit promptly on SIGTERM/SIGINT even when a backend ignores stdin close or SIGTERM, and stop waiting for in-flight startup probes, so process supervisors that force-kill after a grace period (Paseo waits 2s) cannot orphan backend processes.
+- Gateway: let `session/new` wait for the first backend probes when the discovery cache is cold (off by default, `ACPX_GATEWAY_DISCOVERY_WAIT_MS` sets the limit), so response-only clients such as Paseo's catalog probe receive a model list instead of an empty selector.
+- Gateway: a session routed through `_meta.acpx.agent` advertises its backend's own model catalog instead of the merged allowlist, so catalog probes that list a specific backend's models see the full catalog (still filtered by that backend's own `enabledModels`); the `acpx-gateway` merged allowlist keeps curating only the unified selector.
 
 ## 0.19.2 - 2026-09-23
 

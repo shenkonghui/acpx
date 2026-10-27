@@ -41,6 +41,8 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
  */
 export class ModelProbeRunner {
   private runtime: AcpRuntime | undefined;
+  /** One runtime per gateway backend; each spawns gateways limited to that backend. */
+  private backendRuntimes = new Map<string, AcpRuntime>();
 
   constructor(private readonly options: ModelProbeOptions) {}
 
@@ -54,16 +56,16 @@ export class ModelProbeRunner {
     const argv = inspection?.launch.kind === "installed" ? inspection.launch.argv : undefined;
     const backends = await detectGatewayBackendNames(argv, this.options.cwd);
     if (backends !== undefined) {
+      // A failing backend (missing executable, auth error) must not sink the
+      // whole probe; the union just skips its models.
+      const backendResults = await Promise.all(
+        backends.map((backend) =>
+          this.probeBackend(agent, `${sessionKey}:${backend}`, backend).catch(() => undefined),
+        ),
+      );
+      // Results stay in backend order, so the merged order is deterministic.
       const merged = new Map<string, ProbedModel>();
-      for (const backend of backends) {
-        // A failing backend (missing executable, auth error) must not sink the
-        // whole probe; the union just skips its models.
-        const backendModels = await this.probeBackend(
-          runtime,
-          agent,
-          `${sessionKey}:${backend}`,
-          backend,
-        ).catch(() => undefined);
+      for (const backendModels of backendResults) {
         if (backendModels === undefined) {
           continue;
         }
@@ -96,11 +98,11 @@ export class ModelProbeRunner {
   }
 
   private async probeBackend(
-    runtime: AcpRuntime,
     agent: string,
     sessionKey: string,
     backend: string,
   ): Promise<ProbedModel[]> {
+    const runtime = this.runtimeForBackend(backend);
     const backendHandle = await withTimeout(
       runtime.ensureSession({
         sessionKey,
@@ -140,17 +142,56 @@ export class ModelProbeRunner {
 
   private runtimeFor(): AcpRuntime {
     if (!this.runtime) {
-      this.runtime = createAcpRuntime({
-        cwd: this.options.cwd,
-        sessionStore: createFileSessionStore({
-          stateDir: path.join(this.options.stateDir, "model-probe"),
-        }),
-        agentRegistry: this.options.registry,
-        permissionMode: "approve-all",
-        nonInteractivePermissions: "deny",
-        verbose: this.options.verbose === true,
-      });
+      this.runtime = this.createRuntime(this.options.registry);
     }
     return this.runtime;
+  }
+
+  /**
+   * A runtime whose gateways serve only `backend`: the backend name is appended
+   * as a positional `acpx gateway` argument, so a probe does not boot every
+   * configured backend just to reach one of them.
+   */
+  private runtimeForBackend(backend: string): AcpRuntime {
+    const existing = this.backendRuntimes.get(backend);
+    if (existing) {
+      return existing;
+    }
+    const base = this.options.registry;
+    const scoped: AcpInspectableAgentRegistry = {
+      resolve: (agentName: string) => {
+        const resolved = base.resolve(agentName);
+        return Array.isArray(resolved) && resolved.includes("gateway")
+          ? [...resolved, backend]
+          : resolved;
+      },
+      list: () => base.list(),
+      inspect: (agentId: string) => {
+        const inspection = base.inspect(agentId);
+        if (inspection?.launch.kind === "installed" && inspection.launch.argv.includes("gateway")) {
+          return {
+            ...inspection,
+            launch: { kind: "installed" as const, argv: [...inspection.launch.argv, backend] },
+          };
+        }
+        return inspection;
+      },
+    };
+    const runtime = this.createRuntime(scoped);
+    this.backendRuntimes.set(backend, runtime);
+    return runtime;
+  }
+
+  private createRuntime(registry: AcpInspectableAgentRegistry): AcpRuntime {
+    return createAcpRuntime({
+      cwd: this.options.cwd,
+      sessionStore: createFileSessionStore({
+        stateDir: path.join(this.options.stateDir, "model-probe"),
+      }),
+      agentRegistry: registry,
+      permissionMode: "approve-all",
+      nonInteractivePermissions: "deny",
+      verbose: this.options.verbose === true,
+    });
   }
 }

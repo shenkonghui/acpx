@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
@@ -28,6 +31,7 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
+import { writePrivateJsonFile } from "../state-files.js";
 import { EXIT_CODES, type AcpProcessExit, type PermissionMode } from "../types.js";
 import { AcpClient } from "./client.js";
 import type { SessionCreateResult } from "./client.js";
@@ -75,6 +79,24 @@ import {
 const GATEWAY_SESSION_PREFIX = "gw-";
 const AGENT_META_KEY = "acpx";
 const AGENT_META_AGENT_FIELD = "agent";
+/**
+ * Process cleanup budget while shutting down. Supervisors that kill acpx after
+ * a grace period (Paseo waits 2s) must not SIGKILL us mid-retirement, or the
+ * backend processes are orphaned.
+ */
+const GATEWAY_SHUTDOWN_BUDGET_MS = 1_000;
+/** A backend that never answers `initialize` must not hang binds forever. */
+const DEFAULT_BACKEND_START_TIMEOUT_MS = 120_000;
+const BACKEND_START_TIMEOUT_ENV = "ACPX_GATEWAY_START_TIMEOUT_MS";
+/**
+ * How long `session/new` may wait for the first discovery when it would
+ * otherwise return no models at all. Clients that read only the response and
+ * close immediately (catalog probes) never see the pushed updates, so the
+ * default is off and such a client opts in through the environment.
+ */
+const DEFAULT_SESSION_DISCOVERY_WAIT_MS = 0;
+const SESSION_DISCOVERY_WAIT_ENV = "ACPX_GATEWAY_DISCOVERY_WAIT_MS";
+const DISCOVERY_CACHE_VERSION = 1;
 const UNIFIED_MODEL_CONFIG_ID = "model";
 const UNKNOWN_SESSION_ERROR_CODE = -32602;
 const INVALID_PARAMS_ERROR_CODE = -32602;
@@ -175,6 +197,12 @@ type GatewaySession = {
   relayedUpdates: number;
   /** Backend the session was on before a failover moved it elsewhere. */
   failoverOrigin?: { agent: string; model?: string };
+  /**
+   * Bound because the client routed via `_meta.acpx.agent`. Such a session
+   * advertises its backend's own catalog; the merged allowlist curates only
+   * the unified selector.
+   */
+  explicitBackend?: boolean;
 };
 
 function resolveRequestedAgentName(meta: NewSessionRequest["_meta"]): string | undefined {
@@ -218,6 +246,12 @@ function filterModelState(
 export type GatewayBackendReadiness = {
   /** Resolves once the backend process is ready; rejects when it cannot start. */
   waitForStart(agentName: string): Promise<void>;
+  /**
+   * Resolves once every named backend's probe pipeline settled (success or
+   * failure), or after `timeoutMs`. Lets a client that closes right after
+   * `session/new` still receive the first model surface in the response.
+   */
+  waitForDiscovery?(agentNames: readonly string[], timeoutMs: number): Promise<void>;
 };
 
 export type AcpGatewayOptions = {
@@ -502,11 +536,18 @@ export class AcpGateway implements Agent {
     if (requestedName) {
       // Compatibility: an explicit _meta agent binds immediately, preserving the
       // pre-lazy behavior for clients that route by agent name.
-      await this.createBoundSession(session, requestedName, params.cwd);
+      await this.createBoundSession(session, requestedName, params.cwd, {
+        explicitBackend: true,
+      });
       this.sessions.set(gatewaySessionId, session);
       return { sessionId: gatewaySessionId, configOptions: this.boundConfigOptions(session) };
     }
 
+    if (this.mergedSurface().options.length === 0) {
+      // A client that reads only this response would otherwise get an empty
+      // model selector even though probes complete seconds later.
+      await this.waitForInitialDiscovery([...this.clients.keys()]);
+    }
     const defaultState = this.clients.get(this.resolveDefaultAgent());
     if (defaultState?.discovery) {
       session.unifiedPermission = resolveUnifiedCurrentPermission(defaultState.discovery.mode);
@@ -743,12 +784,50 @@ export class AcpGateway implements Agent {
     session: GatewaySession,
     agentName: string,
     cwd: string,
+    options: { explicitBackend?: boolean } = {},
   ): Promise<void> {
     const state = this.requireClient(agentName);
-    await this.readiness?.waitForStart(agentName);
+    await this.waitForBackendStart(agentName);
+    await this.waitForInitialDiscovery([agentName]);
+    if (options.explicitBackend) {
+      session.explicitBackend = true;
+    }
     const created = await state.client.createSession(cwd);
     this.applyCreatedSession(session, state, created);
     this.log(`bound session ${session.gatewaySessionId} to agent ${agentName}`);
+  }
+
+  /**
+   * Surfaces a failed backend launch as a client error. Raw startup failures
+   * would otherwise reach the client as a bare "Internal error".
+   */
+  private async waitForBackendStart(agentName: string): Promise<void> {
+    try {
+      await this.readiness?.waitForStart(agentName);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new RequestError(
+        INVALID_PARAMS_ERROR_CODE,
+        `Failed to start agent "${agentName}": ${message}`,
+      );
+    }
+  }
+
+  /**
+   * Bounded wait for the first probe of backends that have no discovery yet.
+   * Disabled by default; opt in when the client only reads `session/new`.
+   */
+  private async waitForInitialDiscovery(agentNames: readonly string[]): Promise<void> {
+    const timeoutMs = resolveSessionDiscoveryWaitMs();
+    if (timeoutMs <= 0 || !this.readiness?.waitForDiscovery) {
+      return;
+    }
+    const pending = agentNames.filter((name) => !this.clients.get(name)?.discovery);
+    if (pending.length === 0) {
+      return;
+    }
+    this.log(`waiting up to ${timeoutMs}ms for initial discovery of ${pending.join(", ")}`);
+    await this.readiness.waitForDiscovery(pending, timeoutMs);
   }
 
   /** Publishes a freshly created downstream session on the gateway session. */
@@ -1353,7 +1432,10 @@ export class AcpGateway implements Agent {
       return undefined;
     }
     const currentRef = modelRef(state.name, session.backendModels.currentModelId);
-    if (!this.handoff) {
+    // Sessions routed here via `_meta.acpx.agent` advertise their backend's own
+    // catalog (still filtered by that backend's enabledModels); the merged
+    // allowlist only curates the unified selector.
+    if (!this.handoff || session.explicitBackend) {
       return buildModelOption(state.name, session.backendModels);
     }
     return this.mergedModelOption(currentRef);
@@ -1479,6 +1561,223 @@ type BackendReadiness = GatewayBackendReadiness & {
   begin(): Promise<void>;
 };
 
+type ProbeResult = {
+  discovery: BackendDiscovery;
+  /** False when the probe failed; only successful probes are worth caching. */
+  probed: boolean;
+};
+
+/**
+ * Last known discovery per backend, used to answer `session/new` before a slow
+ * backend finishes booting. Entries are keyed by cwd plus the launch
+ * descriptors (hashed, so env values never reach disk).
+ */
+type GatewayDiscoveryCache = {
+  entries: ReadonlyMap<string, BackendDiscovery>;
+  /** Persists a successful probe; failures are logged, never thrown. */
+  record(agentName: string, discovery: BackendDiscovery): Promise<void>;
+};
+
+function launchFingerprint(agent: GatewayAgentSpec): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        agent.agentCommand,
+        agent.agentArgv ?? [],
+        agent.env ?? {},
+        agent.enabledModels ?? [],
+      ]),
+    )
+    .digest("hex");
+}
+
+function discoveryCacheFile(cwd: string, fingerprints: Map<string, string>): string {
+  const launch = Object.fromEntries(
+    [...fingerprints.entries()].toSorted(([left], [right]) => left.localeCompare(right)),
+  );
+  const key = createHash("sha256")
+    .update(JSON.stringify([cwd, launch]))
+    .digest("hex")
+    .slice(0, 32);
+  return path.join(os.homedir(), ".acpx", "gateway-discovery", `${key}.json`);
+}
+
+const BACKEND_MODE_SET_PATHS: ReadonlySet<string> = new Set(["config_option", "set_mode", "none"]);
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function isCachedModelState(value: unknown): value is SessionModelState {
+  const record = asRecord(value);
+  if (!record || typeof record.currentModelId !== "string") {
+    return false;
+  }
+  if (!isOptionalString(record.configId) || !Array.isArray(record.availableModels)) {
+    return false;
+  }
+  return record.availableModels.every((model) => {
+    const item = asRecord(model);
+    return item !== null && typeof item.modelId === "string" && typeof item.name === "string";
+  });
+}
+
+function isCachedModeSupport(value: unknown): value is BackendModeSupport {
+  const mode = asRecord(value);
+  if (!mode || typeof mode.setPath !== "string" || !BACKEND_MODE_SET_PATHS.has(mode.setPath)) {
+    return false;
+  }
+  return (
+    isStringArray(mode.advertisedIds) &&
+    isOptionalString(mode.configId) &&
+    isOptionalString(mode.currentBackendId)
+  );
+}
+
+function isCachedDiscovery(value: unknown): value is BackendDiscovery {
+  const record = asRecord(value);
+  if (!record || !Array.isArray(record.configOptions)) {
+    return false;
+  }
+  if (!record.configOptions.every((option) => asRecord(option) !== null)) {
+    return false;
+  }
+  if (!isCachedModeSupport(record.mode)) {
+    return false;
+  }
+  return record.models === undefined || isCachedModelState(record.models);
+}
+
+function cachedEntries(
+  value: unknown,
+  fingerprints: Map<string, string>,
+): Map<string, BackendDiscovery> {
+  const entries = new Map<string, BackendDiscovery>();
+  const record = asRecord(value);
+  if (record?.version !== DISCOVERY_CACHE_VERSION) {
+    return entries;
+  }
+  for (const [name, stored] of Object.entries(asRecord(record.agents) ?? {})) {
+    const entry = asRecord(stored);
+    if (!entry || entry.launch !== fingerprints.get(name)) {
+      continue;
+    }
+    if (isCachedDiscovery(entry.discovery)) {
+      entries.set(name, entry.discovery);
+    }
+  }
+  return entries;
+}
+
+async function readDiscoveryCache(
+  file: string,
+  fingerprints: Map<string, string>,
+  log: (message: string) => void,
+): Promise<Map<string, BackendDiscovery>> {
+  try {
+    return cachedEntries(JSON.parse(await fs.readFile(file, "utf8")), fingerprints);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      log(`could not read discovery cache: ${String(error)}`);
+    }
+    return new Map();
+  }
+}
+
+function discoveryCachePayload(
+  entries: ReadonlyMap<string, BackendDiscovery>,
+  fingerprints: Map<string, string>,
+): { version: number; agents: Record<string, { launch: string; discovery: BackendDiscovery }> } {
+  const agents: Record<string, { launch: string; discovery: BackendDiscovery }> = {};
+  for (const [name, discovery] of entries) {
+    const launch = fingerprints.get(name);
+    if (launch) {
+      agents[name] = { launch, discovery };
+    }
+  }
+  return { version: DISCOVERY_CACHE_VERSION, agents };
+}
+
+/**
+ * Reads the discovery cache for this cwd and backend set. A missing or corrupt
+ * file is normal (first run, interrupted write) and simply yields no entries.
+ */
+async function loadDiscoveryCache(
+  cwd: string,
+  agents: GatewayAgentSpec[],
+  log: (message: string) => void,
+): Promise<GatewayDiscoveryCache> {
+  const fingerprints = new Map(agents.map((agent) => [agent.name, launchFingerprint(agent)]));
+  const file = discoveryCacheFile(cwd, fingerprints);
+  const entries = await readDiscoveryCache(file, fingerprints, log);
+  if (entries.size > 0) {
+    log(`restored cached discovery for ${[...entries.keys()].join(", ")}`);
+  }
+
+  let writeChain: Promise<void> = Promise.resolve();
+  return {
+    entries,
+    record: (agentName, discovery) => {
+      if (!fingerprints.has(agentName)) {
+        return Promise.resolve();
+      }
+      entries.set(agentName, discovery);
+      // Serialize writes so concurrent probes cannot interleave snapshots.
+      writeChain = writeChain
+        .then(() => writePrivateJsonFile(file, discoveryCachePayload(entries, fingerprints)))
+        .catch((error: unknown) => {
+          log(`could not write discovery cache: ${String(error)}`);
+        });
+      return writeChain;
+    },
+  };
+}
+
+function resolveBackendStartTimeoutMs(): number {
+  const configured = process.env[BACKEND_START_TIMEOUT_ENV];
+  if (!configured) {
+    return DEFAULT_BACKEND_START_TIMEOUT_MS;
+  }
+  const parsed = Number(configured);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BACKEND_START_TIMEOUT_MS;
+}
+
+function resolveSessionDiscoveryWaitMs(): number {
+  const configured = process.env[SESSION_DISCOVERY_WAIT_ENV];
+  if (!configured) {
+    return DEFAULT_SESSION_DISCOVERY_WAIT_MS;
+  }
+  const parsed = Number(configured);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SESSION_DISCOVERY_WAIT_MS;
+}
+
+/**
+ * Starts a backend, bounding how long a bind can wait. An expiry retires the
+ * launch with the shutdown budget so a wedged agent cannot outlive the gateway.
+ */
+function startBackend(state: GatewayClientState, log: (message: string) => void): Promise<void> {
+  const timeoutMs = resolveBackendStartTimeoutMs();
+  const started = state.client.start();
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      log(`agent ${state.name} did not start within ${timeoutMs}ms; closing it`);
+      void state.client.close({ budgetMs: GATEWAY_SHUTDOWN_BUDGET_MS });
+      reject(new Error(`agent "${state.name}" did not start within ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref();
+  });
+  return Promise.race([started, expired]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 /**
  * Starts and probes every backend in parallel.
  *
@@ -1492,20 +1791,35 @@ function createBackendReadiness(
   getGateway: () => AcpGateway | undefined,
   cwd: string,
   log: (message: string) => void,
+  cache: GatewayDiscoveryCache,
 ): BackendReadiness {
   const starts = new Map<string, Promise<void>>();
+  const pipelines = new Map<string, Promise<void>>();
   return {
     waitForStart: async (agentName: string): Promise<void> => {
       await starts.get(agentName);
     },
+    waitForDiscovery: async (agentNames, timeoutMs): Promise<void> => {
+      const pending = agentNames
+        .map((name) => pipelines.get(name))
+        .filter((pipeline): pipeline is Promise<void> => pipeline !== undefined);
+      if (pending.length > 0) {
+        await waitWithTimeout(Promise.all(pending), timeoutMs);
+      }
+    },
     begin: async (): Promise<void> => {
-      const pipelines = states.map((state) => {
-        const started = state.client.start();
+      const running = states.map((state) => {
+        const started = startBackend(state, log);
         starts.set(state.name, started);
-        return started.then(
+        const pipeline = started.then(
           async () => {
             log(`started agent: ${state.name}`);
-            const discovery = await probeBackendQuietly(state, cwd, log);
+            const { discovery, probed } = await probeBackendQuietly(state, cwd, log);
+            if (probed) {
+              // Persist before publishing so a restarted gateway can serve this
+              // surface immediately instead of probing from scratch.
+              await cache.record(state.name, discovery);
+            }
             await getGateway()
               ?.setBackendDiscovery(state.name, discovery)
               .catch((error: unknown) => {
@@ -1516,10 +1830,26 @@ function createBackendReadiness(
             log(`agent ${state.name} failed to start: ${String(error)}`);
           },
         );
+        pipelines.set(state.name, pipeline);
+        return pipeline;
       });
-      await Promise.all(pipelines);
+      await Promise.all(running);
     },
   };
+}
+
+/** Resolves when `promise` settles or `timeoutMs` elapses, whichever comes first. */
+async function waitWithTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+    timer.unref();
+  });
+  await Promise.race([promise, expired]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 /**
@@ -1551,19 +1881,21 @@ async function probeBackendQuietly(
   state: GatewayClientState,
   cwd: string,
   log: (message: string) => void,
-): Promise<BackendDiscovery> {
+): Promise<ProbeResult> {
   let discovery: BackendDiscovery;
   try {
     discovery = await probeBackend(state, cwd);
   } catch (error) {
-    discovery = { configOptions: [], mode: { setPath: "none", advertisedIds: [] } };
     log(`probe failed for agent ${state.name}: ${String(error)} (no models advertised)`);
-    return discovery;
+    return {
+      discovery: { configOptions: [], mode: { setPath: "none", advertisedIds: [] } },
+      probed: false,
+    };
   }
   log(
     `probed agent ${state.name}: models=${discovery.models?.availableModels.length ?? 0} modes=${discovery.mode.advertisedIds.length} (${discovery.mode.setPath})`,
   );
-  return discovery;
+  return { discovery, probed: true };
 }
 
 function createGatewayLogger(verbose: boolean | undefined): (message: string) => void {
@@ -1648,10 +1980,11 @@ function createFailoverController(input: {
   cwd: string;
   log: (message: string) => void;
   getGateway: () => AcpGateway | undefined;
+  recordDiscovery: (agentName: string, discovery: BackendDiscovery) => Promise<void>;
   healthCheckIntervalMs?: number;
   restoreMode?: FailoverRestoreMode;
 }): FailoverController | undefined {
-  const { fallbacks, agents, statesByName, cwd, log, getGateway } = input;
+  const { fallbacks, agents, statesByName, cwd, log, getGateway, recordDiscovery } = input;
   if (fallbacks.length === 0) {
     return undefined;
   }
@@ -1681,6 +2014,7 @@ function createFailoverController(input: {
           await state.client.start();
           const discovery = await probeBackend(state, cwd);
           state.discovery = discovery;
+          await recordDiscovery(agent, discovery);
           await getGateway()?.setBackendDiscovery(agent, discovery);
           log(`respawned agent ${agent}`);
           return true;
@@ -1753,6 +2087,7 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
     ),
   );
   const statesByName = new Map(states.map((state) => [state.name, state]));
+  const discoveryCache = await loadDiscoveryCache(options.cwd, agents, log);
   const failover = createFailoverController({
     fallbacks,
     agents: states.map((state) => state.name),
@@ -1760,13 +2095,20 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
     cwd: options.cwd,
     log,
     getGateway: () => gatewayRef,
+    recordDiscovery: (agentName, discovery) => discoveryCache.record(agentName, discovery),
     ...(options.healthCheckIntervalMs !== undefined
       ? { healthCheckIntervalMs: options.healthCheckIntervalMs }
       : {}),
     ...(options.restoreMode !== undefined ? { restoreMode: options.restoreMode } : {}),
   });
   failoverRef = failover;
-  const readiness = createBackendReadiness(states, () => gatewayRef, options.cwd, log);
+  const readiness = createBackendReadiness(
+    states,
+    () => gatewayRef,
+    options.cwd,
+    log,
+    discoveryCache,
+  );
   const gateway = buildGateway(
     states,
     options,
@@ -1777,6 +2119,11 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
     readiness,
   );
   gatewayRef = gateway;
+  // Seed the cached surface before any session can be created, so `session/new`
+  // advertises the last known models instead of an empty list.
+  for (const [name, discovery] of discoveryCache.entries) {
+    await gateway.setBackendDiscovery(name, discovery);
+  }
   const startup = readiness.begin();
 
   // Backends boot and probe in the background: the gateway answers ACP right
@@ -1793,8 +2140,12 @@ export async function runAcpGateway(options: RunAcpGatewayOptions): Promise<numb
       closing = true;
       failover?.stop();
       log("shutting down; retiring all agents");
-      await Promise.allSettled(states.map((state) => state.client.close()));
-      await startup;
+      // Do not await `startup`: a backend stuck in `initialize` would hold the
+      // exit until the supervisor SIGKILLs us. Closing each client below
+      // abandons its launch instead of waiting for it.
+      await Promise.allSettled(
+        states.map((state) => state.client.close({ budgetMs: GATEWAY_SHUTDOWN_BUDGET_MS })),
+      );
     })();
     return shutdownPromise;
   };

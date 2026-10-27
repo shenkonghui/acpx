@@ -92,11 +92,25 @@ Rules:
   the default agent.
 - Duplicate names, empty agent lists, and more than one default are config
   errors reported before any agent process starts.
-- Every listed agent process is spawned at gateway startup, then probed once
-  with `session/new` to learn its models and session modes. An agent that fails
-  to _start_ aborts the gateway; an agent that fails to _probe_ (for example one
-  that needs auth before `session/new`) is kept reachable through
-  `_meta.acpx.agent` but contributes no models or modes to the merged surface.
+- Every listed agent starts and is probed once with `session/new` to learn its
+  models and session modes. Both happen in parallel in the background, so the
+  gateway answers ACP immediately; each backend's models and modes arrive as a
+  pushed `config_option_update` once its probe lands. A backend that fails to
+  _start_ or _probe_ (for example one that needs auth before `session/new`) is
+  kept reachable through `_meta.acpx.agent` but contributes no models or modes
+  to the merged surface; binding to a backend that cannot start reports the
+  launch error. A start that never completes is abandoned after 120 seconds
+  (`ACPX_GATEWAY_START_TIMEOUT_MS` overrides it).
+- The last successful probe per backend is cached under
+  `~/.acpx/gateway-discovery/`, keyed by the working directory and launch
+  commands (environment values are hashed, never stored). A restarted gateway
+  seeds `session/new` with that surface and replaces it as fresh probes land.
+- A client that reads only the `session/new` response and closes immediately
+  (for example a provider catalog probe) never sees those pushed updates. Set
+  `ACPX_GATEWAY_DISCOVERY_WAIT_MS` to a positive value (such as `15000`) to
+  make `session/new` wait that long for the first probes when no cached
+  surface exists; it is a no-op once the cache supplies models. The default is
+  `0`, which answers immediately.
 - Duplicate agent commands are deduplicated: two names resolving to the same
   command share one process.
 - An entry may carry an `enabledModels` array of bare model ids to whitelist
@@ -126,7 +140,9 @@ The gateway advertises every backend's models as one merged selector on
   [fallback chain](#fallback-chain) when one is configured) before prompting.
 
 `_meta.acpx.agent` still works as an explicit, immediate binding for clients
-that route by agent name:
+that route by agent name. Such a session advertises the routed backend's own
+model catalog (filtered by that backend's own `enabledModels`), not the
+merged allowlist:
 
 ```json
 {
@@ -349,7 +365,10 @@ An `enabledModels` entry on the gateway's own `acpx-gateway` config agent is
 special: because that agent is excluded from the backend list (it would
 recurse), its bare ids are interpreted as prefixed `<agent>/<model>` refs and
 filter the **merged** surface across every backend. Use this to publish only a
-curated subset of the full backend catalog to upstream clients.
+curated subset of the full backend catalog to upstream clients. The merged
+allowlist curates only the unified selector and cross-backend switches: a
+session routed to a backend through `_meta.acpx.agent` advertises that
+backend's own catalog (still filtered by that backend's own `enabledModels`).
 
 ```json
 {
@@ -373,8 +392,9 @@ is honored by `acpx gateway` only.
 
 - **Upstream stdin EOF:** the gateway retires every agent process (close stdin,
   then SIGTERM, then SIGKILL escalation) and exits `0`.
-- **SIGINT/SIGTERM:** the same retirement sequence runs and the gateway exits
-  `130`.
+- **SIGINT/SIGTERM:** the same retirement sequence runs, bounded to about one
+  second, and the gateway exits `130` even when a backend ignores stdin close
+  or SIGTERM, or a startup probe is still in flight.
 - **Agent crash:** prompts bound to that agent fail with the underlying error.
   Without a [fallback chain](#fallback-chain) the gateway does not restart
   agents; route new sessions to a healthy agent. With a chain, a failing

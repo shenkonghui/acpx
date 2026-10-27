@@ -1623,7 +1623,14 @@ export class AcpClient {
     }
   }
 
-  close(): Promise<void> {
+  /**
+   * Retires the connection and the agent process tree.
+   *
+   * `budgetMs` caps the whole process cleanup; process supervisors that kill
+   * acpx on a short deadline pass a smaller budget so the tree is SIGKILLed
+   * before the supervisor gives up.
+   */
+  close(options: { budgetMs?: number } = {}): Promise<void> {
     this.closing = true;
     this.closeEpoch += 1;
     if (this.closeTask) {
@@ -1632,14 +1639,14 @@ export class AcpClient {
     // Publish retirement before callbacks can start a replacement. Every closer
     // must await the same cleanup so an older close cannot reset a newer launch.
     this.closeTask = Promise.resolve()
-      .then(() => this.finishClose())
+      .then(() => this.finishClose(options))
       .finally(() => {
         this.closeTask = undefined;
       });
     return this.closeTask;
   }
 
-  private async finishClose(): Promise<void> {
+  private async finishClose(options: { budgetMs?: number } = {}): Promise<void> {
     const permissionControllers = [...this.permissionAbortControllers.values()];
     this.permissionAbortControllers.clear();
     const owners = [...this.pendingPromptOwners];
@@ -1651,7 +1658,7 @@ export class AcpClient {
       controller.abort();
     }
 
-    await this.retireNativeResources();
+    await this.retireNativeResources(options.budgetMs);
 
     this.sessionUpdateChain = Promise.resolve();
     this.observedSessionUpdates = 0;
@@ -1672,7 +1679,7 @@ export class AcpClient {
     this.agent = undefined;
   }
 
-  private async retireNativeResources(): Promise<void> {
+  private async retireNativeResources(budgetMs?: number): Promise<void> {
     const owned = [...this.commandProbes, ...(this.agent ? [this.agent] : [])];
     const failures: unknown[] = [];
     try {
@@ -1681,7 +1688,7 @@ export class AcpClient {
       failures.push(error);
     }
     const retired = await Promise.allSettled(
-      owned.map((child) => this.terminateAgentProcess(child)),
+      owned.map((child) => this.terminateAgentProcess(child, budgetMs)),
     );
     for (const result of retired) {
       if (result.status === "rejected") {
@@ -1743,7 +1750,7 @@ export class AcpClient {
     }
   }
 
-  private terminateAgentProcess(child: ChildProcess): Promise<void> {
+  private terminateAgentProcess(child: ChildProcess, budgetMs?: number): Promise<void> {
     if (child.pid === undefined) {
       this.agentDescendants.get(child)?.retire();
       this.detachAgentHandles(child, true);
@@ -1751,17 +1758,18 @@ export class AcpClient {
     }
     let cleanup = this.agentCleanups.get(child);
     if (!cleanup) {
-      cleanup = Promise.resolve().then(() => this.cleanupAgentProcess(child));
+      cleanup = Promise.resolve().then(() => this.cleanupAgentProcess(child, budgetMs));
       this.agentCleanups.set(child, cleanup);
     }
     return cleanup;
   }
 
-  private async cleanupAgentProcess(child: ChildProcess): Promise<void> {
+  private async cleanupAgentProcess(child: ChildProcess, budgetMs?: number): Promise<void> {
     const descendants = this.agentDescendants.get(child);
     try {
       await retireAgentProcess(child, descendants, {
         stdinCloseGraceMs: resolveAgentCloseAfterStdinEndMs(this.options.agentCommand),
+        ...(budgetMs !== undefined ? { budgetMs } : {}),
         log: (message) => this.log(message),
       });
     } finally {

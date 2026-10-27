@@ -51,6 +51,11 @@ const failPrompt = argValue('--fail-prompt');
 const failPromptText = argValue('--fail-prompt-text');
 const initDelay = Number(argValue('--init-delay') ?? 0);
 const newSessionDelay = Number(argValue('--new-session-delay') ?? 0);
+const ignoreStdinClose = args.includes('--ignore-stdin-close');
+const ignoreSigterm = args.includes('--ignore-sigterm');
+if (ignoreSigterm) {
+  process.on('SIGTERM', () => {});
+}
 const sleep = (ms) => (ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve());
 
 const QUOTA_ERROR = { code: -32000, message: 'Quota exceeded for this account' };
@@ -209,7 +214,11 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   if (message.id !== undefined && message.id !== null) {
     send({ jsonrpc: '2.0', id: message.id, result: {} });
   }
-}).on('close', () => process.exit(0));
+}).on('close', () => {
+  if (!ignoreStdinClose) {
+    process.exit(0);
+  }
+});
 `;
 
 class GatewayTestClient implements Client {
@@ -362,14 +371,15 @@ function spawnGateway(
   cwd: string,
   configPath: string,
   extraArgs: string[] = [],
+  extraEnv: NodeJS.ProcessEnv = {},
 ): GatewayHarness {
   const child = spawn(
     process.execPath,
     [CLI_PATH, "gateway", "--config", configPath, "--cwd", cwd, "--approve-all", ...extraArgs],
-    { cwd: homeDir, stdio: ["pipe", "pipe", "pipe"] },
+    { cwd: homeDir, env: { ...process.env, ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] },
   );
   let stderr = "";
-  child.stderr?.on("data", (chunk: Buffer | string) => {
+  child.stderr?.on("data", (chunk) => {
     stderr += chunk.toString();
   });
   const input = Writable.toWeb(child.stdin);
@@ -513,11 +523,22 @@ function defaultGatewayAgents(scriptPath: string, promptLog?: string): GatewayAg
   ];
 }
 
+/** Sends SIGTERM and resolves once the gateway process has exited. */
+async function stopGateway(harness: GatewayHarness): Promise<void> {
+  if (harness.child.exitCode !== null || harness.child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise<void>((resolve) => harness.child.once("exit", () => resolve()));
+  harness.child.kill("SIGTERM");
+  await exited;
+}
+
 async function withGateway(
   run: (harness: GatewayHarness, cwd: string) => Promise<void>,
   buildAgents: (scriptPath: string) => GatewayAgentConfig[] = defaultGatewayAgents,
   extraArgs: string[] = [],
   fallbacks?: unknown[],
+  extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<void> {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-gateway-unified-cwd-"));
@@ -528,7 +549,7 @@ async function withGateway(
     };
     const configPath = path.join(homeDir, "gateway.agents.json");
     await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-    const harness = spawnGateway(homeDir, cwd, configPath, extraArgs);
+    const harness = spawnGateway(homeDir, cwd, configPath, extraArgs, extraEnv);
     try {
       await run(harness, cwd);
     } finally {
@@ -1126,6 +1147,154 @@ test("gateway: backends start and probe in parallel", async () => {
   );
 });
 
+test("gateway: a restarted gateway serves the cached model surface on session/new", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-gateway-cache-cwd-"));
+    const scriptPath = await writeAgentScript(homeDir);
+    const configPath = path.join(homeDir, "gateway.agents.json");
+    const config = {
+      agents: [
+        {
+          name: AGENT_ALPHA,
+          argv: [
+            ...agentArgv(scriptPath, AGENT_ALPHA, "alpha-1,alpha-2", "auto,plan", "config"),
+            "--new-session-delay",
+            "3000",
+          ],
+          default: true,
+        },
+      ],
+    };
+    await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+    const first = spawnGateway(homeDir, cwd, configPath);
+    try {
+      await initializeGateway(first);
+      // Waiting for the models also means the probe result was persisted.
+      await openSession(first, { cwd, mcpServers: [] }, ["alpha/alpha-1", "alpha/alpha-2"]);
+    } finally {
+      await stopGateway(first);
+    }
+
+    const second = spawnGateway(homeDir, cwd, configPath);
+    try {
+      await initializeGateway(second);
+      const startedAt = Date.now();
+      const session = await second.connection.newSession({ cwd, mcpServers: [] });
+      const elapsed = Date.now() - startedAt;
+      // The probe still takes 3s, so a non-empty surface here can only come
+      // from the cache.
+      assert.ok(elapsed < 1_500, `session/new took ${elapsed}ms with a cached surface`);
+      assert.deepEqual(selectValues(findOption(session.configOptions, "model")).toSorted(), [
+        "alpha/alpha-1",
+        "alpha/alpha-2",
+      ]);
+    } finally {
+      await stopGateway(second);
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("gateway: session/new waits for the first discovery when the cache is cold", async () => {
+  await withGateway(
+    async (harness, cwd) => {
+      await initializeGateway(harness);
+      const startedAt = Date.now();
+      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+      const elapsed = Date.now() - startedAt;
+      // Response-only clients never see the pushed update, so the wait must
+      // place the first probe's models directly in the response.
+      assert.deepEqual(selectValues(findOption(session.configOptions, "model")).toSorted(), [
+        "alpha/alpha-1",
+        "alpha/alpha-2",
+      ]);
+      assert.ok(elapsed >= 500, `session/new returned after ${elapsed}ms without waiting`);
+    },
+    (scriptPath) => [
+      {
+        name: AGENT_ALPHA,
+        argv: [
+          ...agentArgv(scriptPath, AGENT_ALPHA, "alpha-1,alpha-2", "auto", "config"),
+          "--new-session-delay",
+          "800",
+        ],
+        default: true,
+      },
+    ],
+    [],
+    undefined,
+    { ACPX_GATEWAY_DISCOVERY_WAIT_MS: "5000" },
+  );
+});
+
+test("gateway: a backend that never finishes starting is abandoned", async () => {
+  await withGateway(
+    async (harness, cwd) => {
+      await initializeGateway(harness);
+      const session = await harness.connection.newSession({ cwd, mcpServers: [] });
+      await assert.rejects(
+        () =>
+          harness.connection.prompt({
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: "hello" }],
+          }),
+        /did not start within 300ms/,
+      );
+      // Abandoning the launch must not take the gateway down.
+      const later = await harness.connection.newSession({ cwd, mcpServers: [] });
+      assert.ok(later.sessionId.length > 0);
+    },
+    (scriptPath) => [
+      {
+        name: AGENT_ALPHA,
+        argv: [
+          ...agentArgv(scriptPath, AGENT_ALPHA, "alpha-1", "auto", "config"),
+          "--init-delay",
+          "30000",
+        ],
+        default: true,
+      },
+    ],
+    [],
+    undefined,
+    { ACPX_GATEWAY_START_TIMEOUT_MS: "300" },
+  );
+});
+
+test("gateway: SIGTERM exits within the supervisor grace despite a wedged backend", async () => {
+  await withGateway(
+    async (harness) => {
+      await initializeGateway(harness);
+      await pollUntil(
+        () => harness.stderrText.includes("started agent: alpha"),
+        10_000,
+        "backend to start",
+      );
+      const startedAt = Date.now();
+      const exited = new Promise<number>((resolve) =>
+        harness.child.once("exit", () => resolve(Date.now() - startedAt)),
+      );
+      harness.child.kill("SIGTERM");
+      const elapsed = await exited;
+      // Paseo SIGKILLs acpx 2s after SIGTERM; cleanup must finish before that.
+      assert.ok(elapsed < 2_000, `gateway took ${elapsed}ms to exit after SIGTERM`);
+    },
+    (scriptPath) => [
+      {
+        name: AGENT_ALPHA,
+        argv: [
+          ...agentArgv(scriptPath, AGENT_ALPHA, "alpha-1", "auto", "config"),
+          "--ignore-stdin-close",
+          "--ignore-sigterm",
+        ],
+        default: true,
+      },
+    ],
+    ["--verbose"],
+  );
+});
+
 function configOptionsFromUpdate(
   notification: SessionNotification,
 ): SessionConfigOption[] | undefined {
@@ -1363,5 +1532,84 @@ test("gateway: a chain entry that is not served is rejected at startup", async (
     assert.notEqual(exitCode, 0);
     assert.match(harness.stderrText, /not served by this gateway/);
     await fs.rm(cwd, { recursive: true, force: true });
+  });
+});
+
+test("gateway: the merged allowlist curates the unified selector but not _meta-routed sessions", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-gateway-unified-cwd-"));
+    const scriptPath = await writeAgentScript(homeDir);
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            [AGENT_ALPHA]: {
+              argv: agentArgv(scriptPath, AGENT_ALPHA, "alpha-1,alpha-2", "auto", "config"),
+            },
+            [AGENT_BETA]: {
+              argv: agentArgv(scriptPath, AGENT_BETA, "beta-1", "auto", "config"),
+            },
+            "acpx-gateway": {
+              argv: [process.execPath, CLI_PATH, "gateway", "--handoff"],
+              enabledModels: ["alpha/alpha-1", "beta/beta-1"],
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const child = spawn(
+      process.execPath,
+      [CLI_PATH, "gateway", "--cwd", cwd, "--approve-all", "--handoff"],
+      { cwd: homeDir, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const input = Writable.toWeb(child.stdin);
+    const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
+    const client = new GatewayTestClient();
+    const connection = new ClientSideConnection(() => client, ndJsonStream(input, output));
+    const harness = {
+      client,
+      connection,
+      child,
+      get stderrText(): string {
+        return stderr;
+      },
+    };
+    try {
+      await initializeGateway(harness);
+
+      // The unified selector is filtered by the acpx-gateway merged allowlist.
+      const unified = await openSession(harness, { cwd, mcpServers: [] }, [
+        "alpha/alpha-1",
+        "beta/beta-1",
+      ]);
+      assert.deepEqual(selectValues(findOption(unified.configOptions, "model")).toSorted(), [
+        "alpha/alpha-1",
+        "beta/beta-1",
+      ]);
+
+      // A session routed through _meta advertises alpha's own full catalog:
+      // the merged allowlist must not leak into explicitly routed bindings.
+      const bound = await openSession(
+        harness,
+        { cwd, mcpServers: [], _meta: { acpx: { agent: AGENT_ALPHA } } },
+        ["alpha/alpha-1", "alpha/alpha-2"],
+      );
+      assert.deepEqual(selectValues(findOption(bound.configOptions, "model")).toSorted(), [
+        "alpha/alpha-1",
+        "alpha/alpha-2",
+      ]);
+    } finally {
+      child.kill("SIGTERM");
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 });
